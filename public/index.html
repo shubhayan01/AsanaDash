@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Asana Dash</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" defer></script>
+</head>
+<body>
+  <div id="gate" class="gate"><div class="spinner"></div></div>
+
+  <div id="app" hidden>
+    <aside class="sidebar">
+      <div class="logo"><span class="logo-mark"></span><span class="logo-text">Asana<b>Dash</b></span></div>
+      <nav class="nav">
+        <button class="nav-item active" data-view="dashboard"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>Time Report</span></button>
+        <button class="nav-item" data-view="custom"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Custom Report</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <button id="theme-btn" class="ghost-btn"><span>◐ Theme</span></button>
+        <button id="accent-btn" class="ghost-btn"><input type="color" id="accent-picker" value="#6d5efc" /><span>Accent</span></button>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <label class="ws-select"><span>Workspace</span><select id="workspace-select" class="select"></select></label>
+        <div class="topbar-right">
+          <button id="refresh-btn" class="icon-btn" title="Clear cache & re-scrape this workspace">⟳</button>
+          <div class="user-pill"><span class="user-avatar" id="user-avatar"></span><span id="user-label"></span><button id="logout-btn" class="link-btn">Log out</button></div>
+        </div>
+      </header>
+
+      <div id="banner" class="banner" hidden></div>
+
+      <!-- ══ TIME REPORT ══ -->
+      <section id="view-dashboard" class="view">
+        <div class="view-title">
+          <h1>Time Report</h1>
+          <p class="muted">Pick projects and people, then generate the report.</p>
+        </div>
+
+        <div class="query card">
+          <div class="ctrl grow">
+            <label>1. Department (portfolio)</label>
+            <select id="portfolio-select" class="select"><option value="all">All departments</option></select>
+          </div>
+          <div class="ctrl grow">
+            <label>2. Pick your projects <span id="proj-count" class="muted"></span></label>
+            <div class="proj-filter">
+              <button id="proj-btn" class="select proj-btn">Choose projects ▾</button>
+              <div id="proj-menu" class="proj-menu" hidden></div>
+            </div>
+          </div>
+          <div class="ctrl grow">
+            <label>3. Pick people <span id="emp-count" class="muted">· everyone</span></label>
+            <div class="proj-filter">
+              <button id="emp-btn" class="select proj-btn">Everyone ▾</button>
+              <div id="emp-menu" class="proj-menu" hidden></div>
+            </div>
+          </div>
+          <div class="ctrl">
+            <label>4. Which date to use</label>
+            <select id="date-basis" class="select">
+              <option value="tracked">Actual time tracked</option>
+              <option value="created">When task was created</option>
+              <option value="completed">When task was completed</option>
+              <option value="due">When task was due</option>
+            </select>
+          </div>
+          <div class="ctrl">
+            <label>5. Time period</label>
+            <select id="date-range" class="select">
+              <option value="all">All time</option>
+              <option value="week">This week</option>
+              <option value="last_week">Last week</option>
+              <option value="month">This month</option>
+              <option value="last_month">Last month</option>
+              <option value="quarter">This quarter</option>
+              <option value="year">This year</option>
+              <option value="custom">Pick exact dates…</option>
+            </select>
+          </div>
+          <div class="ctrl custom-range" id="custom-range" hidden>
+            <label>From / To</label>
+            <div class="range-inputs"><input type="date" id="range-from" class="input" /><input type="date" id="range-to" class="input" /></div>
+          </div>
+          <button id="run-btn" class="primary-btn">Show me the report ✦</button>
+        </div>
+
+        <div id="dash-body">
+          <div class="placeholder"><div class="placeholder-icon">⏱️</div><h3>Pick a project or a person to start</h3><p class="muted">Then click “Show me the report”.</p></div>
+        </div>
+      </section>
+
+      <!-- ══ CUSTOM REPORT (AI) ══ -->
+      <section id="view-custom" class="view" hidden>
+        <div class="view-title">
+          <h1>Custom Report <span class="report-tag" id="ai-model-tag">AI</span></h1>
+          <p class="muted">Describe the report in plain words. The AI figures out the scope + data and fetches just that.</p>
+        </div>
+        <div class="chat card">
+          <div class="chat-input">
+            <textarea id="chat-text" class="textarea" placeholder="e.g. How much time did each person spend on the website project last month?"></textarea>
+            <button id="chat-send" class="primary-btn">Ask ✦</button>
+          </div>
+          <div class="chat-examples" id="chat-examples"></div>
+        </div>
+        <div id="custom-output" class="report-output">
+          <div class="placeholder"><div class="placeholder-icon">💬</div><h3>Ask for any report</h3><p class="muted">Try: “time per project this quarter”, “who worked the most on Marketing”, “employee vs project time matrix”.</p></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script src="/js/dashboard.js"></script>
+</body>
+</html>

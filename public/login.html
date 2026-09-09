@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign in · Asana Dash</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <div class="login-logo">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    </div>
+    <h1>Asana Dash</h1>
+    <p class="login-sub">Sign in to your dashboard</p>
+
+    <form id="login-form" autocomplete="off">
+      <label>
+        <span>Username</span>
+        <input type="text" id="username" name="username" required autofocus />
+      </label>
+      <label>
+        <span>Password</span>
+        <input type="password" id="password" name="password" required />
+      </label>
+      <button type="submit" id="login-btn">Sign in</button>
+      <p class="login-error" id="login-error" hidden></p>
+    </form>
+
+    <p class="login-hint" id="config-hint" hidden></p>
+  </main>
+  <script src="/js/login.js"></script>
+</body>
+</html>
