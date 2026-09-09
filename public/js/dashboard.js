@@ -368,7 +368,7 @@ const groupKey = {
   status: [(e) => statusOf(e), (e) => statusOf(e)],
   month: [(e) => +monthStart(e.enteredOn), (e) => monthLabel(e.enteredOn)],
 };
-function statusOf(e) { return e.completed ? 'Completed' : e.overdue ? 'Overdue' : 'Open'; }
+function statusOf(e) { return e.completed ? 'Completed' : e.overdue ? 'Incomplete task' : 'Open'; }
 function monthStart(d) { if (!d) return 0; const x = new Date(d); x.setDate(1); x.setHours(0, 0, 0, 0); return x; }
 function monthLabel(d) { return d ? new Date(d).toLocaleDateString(undefined, { year: 'numeric', month: 'short' }) : 'Undated'; }
 
@@ -449,8 +449,8 @@ function buildReportShell(container) {
        <div class="tabs" id="tabs">
          <button data-tab="summary" class="${f.tab === 'summary' ? 'active' : ''}">📋 Overview</button>
          ${contentReady ? `<button data-tab="content" class="${f.tab === 'content' ? 'active' : ''}">✍️ Content</button>` : ''}
-         <button data-tab="charts" class="${f.tab === 'charts' ? 'active' : ''}">📊 Time report 1</button>
-         <button data-tab="matrix" class="${f.tab === 'matrix' ? 'active' : ''}">🧑‍🤝‍🧑 Time report 2</button>
+         <button data-tab="charts" class="${f.tab === 'charts' ? 'active' : ''}">📊 Summary report 1</button>
+         <button data-tab="matrix" class="${f.tab === 'matrix' ? 'active' : ''}">🧑‍🤝‍🧑 Summary report 2</button>
          <button data-tab="sheet" class="${f.tab === 'sheet' ? 'active' : ''}">🔢 Table view</button>
        </div>
      </div>
@@ -599,7 +599,7 @@ function richAgg(tasks, keyFn, nameFn, timeFn) {
 }
 function richTable(rows, label, showTime) {
   if (!rows.length) return '<p class="empty">No data for this selection.</p>';
-  const th = `<th>${esc(label)}</th><th class="num">Tasks</th><th class="num">Completed</th><th class="num">Overdue</th>` +
+  const th = `<th>${esc(label)}</th><th class="num">Tasks</th><th class="num">Completed</th><th class="num">Incomplete task</th>` +
     (showTime ? '<th class="num">Actual time</th>' : '');
   return `<div class="table-wrap card-scroll"><table class="data">
     <thead><tr>${th}</tr></thead>
@@ -612,7 +612,7 @@ function richTable(rows, label, showTime) {
     </tr>`).join('')}</tbody></table></div>`;
 }
 function exportRich(rows, label, showTime) {
-  const header = [label, 'Tasks', 'Completed', 'Overdue'];
+  const header = [label, 'Tasks', 'Completed', 'Incomplete task'];
   if (showTime) header.push('Actual time (minutes)', 'Actual time');
   downloadCsv(`asana-${label.toLowerCase()}-${Date.now()}.csv`, header, rows.map((r) => {
     const row = [r.name, r.assigned, r.done, r.overdue];
@@ -925,7 +925,7 @@ function renderCharts(panel, entries) {
   // Status donut (distinct tasks in scope)
   const seen = new Set(); let done = 0, over = 0, open = 0;
   entries.forEach((e) => { if (seen.has(e.taskGid)) return; seen.add(e.taskGid); if (e.completed) done++; else if (e.overdue) over++; else open++; });
-  drawDoughnut('c-status', ['Completed', 'Overdue', 'Open'], [done, over, open], [cssv('--ok'), cssv('--danger'), cssv('--accent')]);
+  drawDoughnut('c-status', ['Completed', 'Incomplete task', 'Open'], [done, over, open], [cssv('--ok'), cssv('--danger'), cssv('--accent')]);
 }
 function topTasks(entries) {
   const m = new Map();
@@ -978,7 +978,7 @@ function renderSheet(panel, entries) {
   const s = state.filters.sort;
   const rows = sheetRows(entries);
   const cap = 800;
-  const head = '<tr>' + SHEET_COLS.map((c) => `<th data-col="${c.key}">${esc(c.label)} ${s.col === c.key ? `<span class="arrow">${s.dir === 'desc' ? '▼' : '▲'}</span>` : ''}</th>`).join('') + '</tr>';
+  const head = '<tr>' + SHEET_COLS.map((c) => `<th data-col="${c.key}"${c.type === 'num' ? ' class="num"' : ''}>${esc(c.label)} ${s.col === c.key ? `<span class="arrow">${s.dir === 'desc' ? '▼' : '▲'}</span>` : ''}</th>`).join('') + '</tr>';
   const cell = (e, c) => {
     if (c.key === 'taskName') return `<td class="wrap">${esc(e.taskName)}</td>`;
     if (c.key === 'minutes') return `<td class="num">${fmtDuration(e.minutes)}</td>`;
