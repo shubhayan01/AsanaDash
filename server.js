@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
 const cron = require('node-cron');
+const { createSnapshot } = require('./snapshot');
 
 const app = express();
 
@@ -81,13 +82,27 @@ function purgeCache(reason) {
 // Safety net in case the process was asleep when the cron should have run:
 // any request after the IST date changes triggers a purge too.
 function ensureFreshDay() {
-  if (istCacheDay() !== cacheDay) purgeCache('day rollover');
+  if (istCacheDay() !== cacheDay) {
+    purgeCache('day rollover');
+    snapshot.refreshAll(); // background re-scrape in case the process slept through the cron
+  }
 }
 
-// Run the purge every day at midnight India Standard Time.
-cron.schedule('0 0 * * *', () => purgeCache('daily 12:00 AM IST refresh'), {
-  timezone: 'Asia/Kolkata',
-});
+/* ─── Pre-loaded snapshot (the "auto-fetch so mornings are instant" engine) ──
+ * The snapshot engine scrapes every workspace server-side — on startup and
+ * every night at 12:00 AM IST — and serves it pre-assembled so the browser
+ * opens reports with zero Asana round-trips. Nightly runs are incremental
+ * (only tasks changed since the last run), so we fetch just the last day's
+ * data and never re-download what we already have.
+ */
+const snapshot = createSnapshot({ token: ASANA_TOKEN });
+
+// Every night at 12:00 AM IST: drop the thin URL-passthrough cache AND refresh
+// the pre-loaded snapshot, so the morning starts from fresh Asana data.
+cron.schedule('0 0 * * *', () => {
+  purgeCache('daily 12:00 AM IST refresh');
+  snapshot.refreshAll();
+}, { timezone: 'Asia/Kolkata' });
 
 /* ─── Helpers ───────────────────────────────────────────────── */
 
@@ -212,6 +227,27 @@ app.get('/api/cache-day', requireAuth, (req, res) => {
   res.json({ day: istCacheDay() });
 });
 
+// Per-scope cache: the browser sends the workspace + the project gids it's about
+// to report on, and gets back just those projects' tasks + time entries from the
+// server cache (fetching any not cached yet, throttled). `missing` lists projects
+// we couldn't serve, which the browser then live-fetches itself. Small payload,
+// instant for anything already cached.
+app.post('/api/cached-scope', requireAuth, async (req, res) => {
+  if (!ASANA_TOKEN) return res.status(500).json({ error: 'ASANA_TOKEN not configured in .env' });
+  const ws = (req.body && req.body.workspace) || '';
+  const gids = (req.body && Array.isArray(req.body.projects)) ? req.body.projects.slice(0, 400) : [];
+  if (!ws || !gids.length) return res.status(400).json({ error: 'workspace and projects[] required' });
+  res.set('Cache-Control', 'no-store');
+  try { res.json(await snapshot.ensureScope(ws, gids)); }
+  catch (e) { res.status(502).json({ error: 'scope fetch failed', detail: String(e) }); }
+});
+
+// Lightweight cache health (how many projects are warm vs known).
+app.get('/api/cache-status', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(snapshot.status(req.query.workspace));
+});
+
 /* ─── Groq proxy ────────────────────────────────────────────── */
 
 // List the models actually available to this API key ("check first").
@@ -242,7 +278,12 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`\n  Asana Dash running →  http://localhost:${PORT}`);
-  console.log(`  🗓  Cache day ${cacheDay} — auto-refreshes daily at 12:00 AM IST.\n`);
+  console.log(`  🗓  Cache day ${cacheDay} — auto-refreshes daily at 12:00 AM IST.`);
+  // Warm the pre-loaded snapshot in the background so it's ready soon after boot
+  // (e.g. after a redeploy). Does not block the server from accepting requests;
+  // the frontend falls back to live fetch until this finishes.
+  if (ASANA_TOKEN) { console.log('  📸 Warming snapshot in the background…\n'); snapshot.refreshAll(); }
+  else console.log('');
   if (!ASANA_TOKEN || !GROQ_API_KEY || !ADMIN_PASS) {
     console.log('  ⚠  Missing config. Copy .env.example to .env and fill in:');
     if (!ADMIN_PASS) console.log('     - ADMIN_PASS');

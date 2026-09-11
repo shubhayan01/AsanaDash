@@ -18,6 +18,7 @@ const state = {
   filters: { basis: 'tracked', range: 'all', from: null, to: null, metric: 'time', search: '', person: 'all', tab: 'summary', sort: { col: 'minutes', dir: 'desc' } },
   selectedPortfolio: 'all', portfolios: [], portfolioItems: {}, projectIndex: new Map(),
   charts: {}, ai: { model: null },
+  snapshot: { ready: false }, // server-side pre-loaded data for the current workspace
 };
 
 const settings = (() => { try { return { theme: 'dark', accent: '#6d5efc', fieldMap: {}, ...JSON.parse(localStorage.getItem('asanaDash.v4') || '{}') }; } catch { return { theme: 'dark', accent: '#6d5efc', fieldMap: {} }; } })();
@@ -35,6 +36,7 @@ const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); retur
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 function fmtDuration(min) { min = Math.round(min || 0); if (!min) return '0m'; const h = Math.floor(min / 60), m = min % 60; return h ? (m ? `${h}h ${m}m` : `${h}h`) : `${m}m`; }
 function fmtDate(d) { return d ? new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '—'; }
+function fmtDateTime(d) { return d ? new Date(d).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—'; }
 function parseDate(s) { return s ? new Date(/^\d{4}-\d{2}-\d{2}$/.test(s) ? s + 'T00:00:00' : s) : null; }
 
 async function mapPool(items, size, fn, onProgress) {
@@ -92,20 +94,17 @@ async function idbGetPrefix(prefix) { try { const db = await idb(); return await
 async function idbDeletePrefix(prefix) { try { const db = await idb(); await new Promise((res, rej) => { const tx = db.transaction(STORE, 'readwrite'); const st = tx.objectStore(STORE); const cur = st.openCursor(); cur.onsuccess = (e) => { const c = e.target.result; if (c) { if (String(c.key).startsWith(prefix)) st.delete(c.key); c.continue(); } }; tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch { /* ignore */ } }
 async function idbClearAll() { try { const db = await idb(); await new Promise((res, rej) => { const tx = db.transaction(STORE, 'readwrite'); tx.objectStore(STORE).clear(); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch { /* ignore */ } }
 
-/* Daily cache expiry: the server rolls its cache over at 12:00 AM IST and
- * exposes the current day via /api/cache-day. When that day differs from
- * the one we last stored, wipe ALL of IndexedDB (every workspace) so old
- * data is dropped to make room for fresh — then remember the new day. */
+/* Daily freshness: the server rebuilds its pre-loaded snapshot at 12:00 AM IST
+ * and exposes the current day via /api/cache-day. The snapshot is now the source
+ * of truth for freshness — selectWorkspace overlays it on top of whatever is in
+ * IndexedDB — so we no longer wipe the local cache on a new day (that only made
+ * mornings slow). We just record the day for reference. */
 const CACHE_DAY_KEY = 'asanaDash.cacheDay';
 async function enforceCacheDay() {
   let day;
   try { day = (await apiJson('/api/cache-day')).day; } catch { return; }
   if (!day) return;
-  const stored = (() => { try { return localStorage.getItem(CACHE_DAY_KEY); } catch { return null; } })();
-  if (stored !== day) {
-    if (stored) await idbClearAll(); // a new IST day → evict yesterday's cache
-    try { localStorage.setItem(CACHE_DAY_KEY, day); } catch { /* ignore */ }
-  }
+  try { localStorage.setItem(CACHE_DAY_KEY, day); } catch { /* ignore */ }
 }
 
 // Warm the in-memory cache from IndexedDB for a workspace.
@@ -163,6 +162,28 @@ async function selectWorkspace(gid) {
   buildProjectMenu();
   buildEmployeeMenu();
   $('#dash-body').innerHTML = `<div class="placeholder"><div class="placeholder-icon">⏱️</div><h3>Pick a project or a person to start</h3><p class="muted">Optionally choose a department first, then a project (to see its people) or a person (to see their projects) — then click “Show me the report”.</p></div>`;
+}
+
+/* Pull the selected projects' tasks + time entries from the SERVER cache (warmed
+ * nightly + on demand) into our in-memory cache, so fetchScope then finds them
+ * locally and the report opens instantly with no Asana round-trips. Projects the
+ * server couldn't serve are returned in `missing` and fall through to the normal
+ * live fetch. Safe no-op on any error. Returns the set of gids served instantly. */
+async function loadCachedScope(gids, onProgress) {
+  const ws = state.workspaceGid;
+  const need = gids.filter((g) => !state.cache.projectTasks[g]); // skip what we already have locally
+  if (!need.length) return new Set(gids);
+  if (onProgress) onProgress('Loading pre-cached data…');
+  let snap;
+  try {
+    snap = await apiJson('/api/cached-scope', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace: ws, projects: need }) });
+  } catch { return new Set(); }
+  if (!snap || !snap.have) return new Set();
+  const byProj = {};
+  (snap.tasks || []).forEach((t) => { (byProj[t._projectGid] || (byProj[t._projectGid] = [])).push(t); });
+  snap.have.forEach((pg) => { const arr = byProj[pg] || []; state.cache.projectTasks[pg] = arr; idbSet(`t3:${ws}:${pg}`, arr); });
+  Object.entries(snap.entries || {}).forEach(([tg, v]) => { if (!state.cache.taskEntries[tg]) state.cache.taskEntries[tg] = v; idbSet(`e:${ws}:${tg}`, v); });
+  return new Set(snap.have);
 }
 
 // Portfolios (departments) — org workspaces only; Asana lists those you own.
@@ -410,6 +431,8 @@ async function runReport() {
   };
   try {
     if (mode === 'employee' && gids.length > 20) body.innerHTML = `<div class="card"><div class="progress-note"><div class="spinner"></div><span>Looking through all ${gids.length} projects for the selected people… (cached after the first time)</span></div></div>`;
+    await loadCachedScope(gids, (m) => onProgress(m)).catch(() => {}); // warm from server cache first (instant when pre-loaded)
+    if (myRun !== state.runId) return;
     const scope = await fetchScope(gids, precise, onProgress, (partial) => draw(partial, true));
     draw(scope, false);
   } catch (e) { if (myRun === state.runId && e.message !== 'auth') body.innerHTML = `<div class="banner error" style="margin:0">Fetch failed: ${esc(e.message)}</div>`; }
@@ -1142,6 +1165,7 @@ async function runCustom() {
     if (spec.project_contains) { const q = spec.project_contains.toLowerCase(); gids = state.projects.filter((p) => p.name.toLowerCase().includes(q)).map((p) => p.gid); }
     if (!gids || !gids.length) gids = state.projects.map((p) => p.gid);
     const precise = gids.length <= 8;
+    await loadCachedScope(gids, (m) => { const s = out.querySelector('span'); if (s) s.textContent = m; }).catch(() => {});
     const scope = await fetchScope(gids, precise, (msg) => { const s = out.querySelector('span'); if (s) s.textContent = msg; });
     renderCustomResult(out, spec, scope, query);
   } catch (e) { out.innerHTML = `<div class="banner error" style="margin:0">AI request failed: ${esc(e.message)}</div>`; }
