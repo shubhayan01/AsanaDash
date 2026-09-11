@@ -187,24 +187,16 @@ function createSnapshot(opts = {}) {
     return rec;
   }
 
-  /* ── Public: make sure a scope is cached, return just that scope ──
+  /* ── Public: return the ALREADY-cached part of a scope immediately ──
    * Returns { ready, building, builtAt, tasks:[...], entries:{...}, have:[gids],
-   * missing:[gids] }. Missing = projects we couldn't cache in time; the caller
-   * (browser) live-fetches those so the user still gets a full report. */
-  async function ensureScope(ws, gids) {
+   * missing:[gids] } right away — it NEVER blocks fetching from Asana. Projects
+   * not cached yet come back in `missing` (the browser live-fetches those, with
+   * its own progress + instant estimate) and are warmed in the BACKGROUND so the
+   * next open is instant. This keeps the request fast no matter how many
+   * projects (or a whole person's worth) were selected. */
+  function ensureScope(ws, gids) {
     if (!token) return { ready: false, tasks: [], entries: {}, have: [], missing: gids };
-    await ensureWsMeta(ws).catch(() => {});
-    if (!meGid) { try { meGid = (await asanaGet('users/me?opt_fields=name').catch(() => null))?.data?.gid || meGid; } catch { /* ignore */ } }
-
-    const have = [], missing = [];
-    // Fetch any requested projects we don't have yet (throttled; bounded by the
-    // user's selection size, which is normally small).
-    const toFetch = gids.filter((g) => !projCache.has(key(ws, g)));
-    await mapPool(toFetch, Math.min(CONCURRENCY, 4), async (g) => {
-      try { await buildProject(ws, g, null); } catch { /* fall through to missing */ }
-    });
-
-    const tasks = [], entries = {};
+    const tasks = [], entries = {}, have = [], missing = [];
     gids.forEach((g) => {
       const rec = projCache.get(key(ws, g));
       if (rec && rec.builtAt) {
@@ -216,7 +208,35 @@ function createSnapshot(opts = {}) {
         missing.push(g);
       }
     });
+    if (missing.length) warmInBackground(ws, missing); // grow coverage without blocking
     return { ready: have.length > 0, building, builtAt: newestBuiltAt(ws, have), tasks, entries, have, missing, day: istCacheDay() };
+  }
+
+  /* ── Background warmer ─────────────────────────────────────────
+   * Projects that were requested but not cached get fetched one at a time in the
+   * background (sharing the global rate limiter), so they're instant next time.
+   * "Pre-load everything over time", driven by what people actually open. */
+  const warmQueue = new Set(); // `${ws}:${gid}` pending
+  const inFlight = new Set();
+  let warming = false;
+  function warmInBackground(ws, gids) {
+    gids.forEach((g) => { const k = key(ws, g); if (!inFlight.has(k) && !projCache.has(k)) warmQueue.add(k); });
+    if (!warming) drainWarm();
+  }
+  async function drainWarm() {
+    warming = true;
+    try {
+      while (warmQueue.size) {
+        const k = warmQueue.values().next().value;
+        warmQueue.delete(k);
+        if (inFlight.has(k) || projCache.has(k)) continue;
+        inFlight.add(k);
+        const i = k.indexOf(':'), ws = k.slice(0, i), gid = k.slice(i + 1);
+        try { await ensureWsMeta(ws).catch(() => {}); await buildProject(ws, gid, null); }
+        catch (e) { lastError = String(e); }
+        finally { inFlight.delete(k); }
+      }
+    } finally { warming = false; }
   }
 
   function newestBuiltAt(ws, gids) {

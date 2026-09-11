@@ -173,10 +173,16 @@ async function loadCachedScope(gids, onProgress) {
   const ws = state.workspaceGid;
   const need = gids.filter((g) => !state.cache.projectTasks[g]); // skip what we already have locally
   if (!need.length) return new Set(gids);
-  if (onProgress) onProgress('Loading pre-cached data…');
+  if (onProgress) onProgress('Checking for pre-loaded data…');
   let snap;
   try {
-    snap = await apiJson('/api/cached-scope', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace: ws, projects: need }) });
+    // Safety belt: never let this block the report. The server returns cached
+    // data immediately; if the network stalls, we just fall through to live fetch.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      snap = await apiJson('/api/cached-scope', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace: ws, projects: need }), signal: ctrl.signal });
+    } finally { clearTimeout(timer); }
   } catch { return new Set(); }
   if (!snap || !snap.have) return new Set();
   const byProj = {};
