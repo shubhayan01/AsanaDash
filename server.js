@@ -243,9 +243,9 @@ app.post('/api/cached-scope', requireAuth, async (req, res) => {
 });
 
 // Lightweight cache health (how many projects are warm vs known).
-app.get('/api/cache-status', requireAuth, (req, res) => {
+app.get('/api/cache-status', requireAuth, async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json(snapshot.status(req.query.workspace));
+  res.json(await snapshot.status(req.query.workspace));
 });
 
 /* ─── Groq proxy ────────────────────────────────────────────── */

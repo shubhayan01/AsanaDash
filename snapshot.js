@@ -1,37 +1,46 @@
 /**
- * Asana Dash — server-side cache engine.
+ * Asana Dash — server-side, disk-backed cache engine.
  *
- * Why this exists: the browser used to scrape Asana live on every report, so
- * the first open of any scope waited through dozens–hundreds of Asana calls.
- * This workspace is large (hundreds of projects, 100k+ tasks, 50k+ timed
- * tasks), so two things are true:
- *   1. We cannot hand the whole workspace to the browser — it would be 100+ MB.
+ * Why this exists: reports used to scrape Asana live on every open, so the first
+ * open of any scope waited through dozens–hundreds of Asana calls. This
+ * workspace is large (hundreds of projects, 100k+ tasks, 50k+ timed tasks), so:
+ *   1. We cannot hand the whole workspace to the browser at once (100+ MB).
  *   2. A full precise scrape is tens of thousands of calls and WILL get rate-
  *      limited unless every request is throttled.
+ *   3. Holding it all in RAM risks running the server out of memory.
  *
- * So the server keeps the heavy data and serves it PER SCOPE:
- *   • `ensureScope(ws, gids)` makes sure the requested projects' tasks + time
- *     entries are cached (fetching any that aren't, rate-limited), and returns
- *     just those — small and instant for the browser.
- *   • `refreshAll()` runs on a schedule (12:00 AM IST): it re-pulls only what
- *     CHANGED since the last run (Asana `modified_since`) for every project
- *     already in the cache, and back-fills a few not-yet-cached projects each
- *     run so coverage grows toward "everything" over time — all behind a global
- *     rate limiter so Asana never throttles us.
- *   • Projects nobody has opened in a while are pruned so memory stays bounded.
+ * So the server caches each project's tasks + time entries AS A FILE ON DISK and
+ * serves data PER SCOPE. Because the cache is on the server (not the browser's
+ * local storage), ANY device — including a brand-new PC with no local cache —
+ * gets the data instantly on click. Because it's on disk, it survives server
+ * restarts/redeploys (point DATA_DIR at a persistent volume to keep it across
+ * Railway deploys too).
  *
- * Everything degrades gracefully: if a scope isn't cached yet, the caller is
- * told, and the browser falls back to its normal live fetch for that scope.
+ *   • `ensureScope(ws, gids)` returns the already-cached projects immediately
+ *     (reading their files), and warms any not-yet-cached ones in the background.
+ *   • `refreshAll()` runs on a schedule (12:00 AM IST): re-pulls only what
+ *     CHANGED since the last run (Asana `modified_since`) for cached projects,
+ *     and back-fills every not-yet-cached project so coverage reaches
+ *     "everything" — all behind a global rate limiter so Asana never throttles.
+ *   • Projects nobody has opened in PRUNE_DAYS are deleted so disk stays bounded.
+ *
+ * Degrades gracefully: if disk is unavailable it falls back to an in-memory map;
+ * if a scope isn't cached yet, the browser live-fetches it (with its own
+ * progress + instant estimate) while the server warms it for next time.
  */
 
 'use strict';
+
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
 
 const ASANA_BASE = 'https://app.asana.com/api/1.0';
 const DAY = 86400000;
 
 // Fields the browser needs per task. Kept in sync with TASK_FIELDS in
 // public/js/dashboard.js. `memberships` is requested to resolve the section /
-// project, then stripped from the stored task to save memory.
+// project, then stripped from the stored task to save space.
 const TASK_FIELDS = [
   'name', 'completed', 'completed_at', 'created_at', 'due_on', 'due_at',
   'assignee.name', 'assignee.gid', 'permalink_url', 'actual_time_minutes',
@@ -50,40 +59,83 @@ function istCacheDay() {
 
 function createSnapshot(opts = {}) {
   const token = opts.token || '';
-  // Tunables (env-overridable) — conservative defaults that stay well under
-  // Asana's rate limits and keep memory bounded.
+  // Tunables (env-overridable). Defaults stay well under Asana's rate limits.
   const CONCURRENCY = +opts.concurrency || 6;
-  const PRUNE_DAYS = +opts.pruneDays || 60;        // drop projects nobody opened in this long
-  const BACKFILL_PER_RUN = +opts.backfillPerRun || 25; // projects to back-fill each nightly run
+  const PRUNE_DAYS = +opts.pruneDays || 90;  // delete projects unopened this long
+  const DATA_DIR = opts.dataDir || process.env.ASANA_CACHE_DIR || path.join(__dirname, '.cache');
+  const PARSE_CACHE_MAX = +opts.parseCacheMax || 120; // hot projects kept parsed in RAM
 
-  // ── Per-project cache ───────────────────────────────────────
-  // key `${ws}:${projectGid}` → { ws, gid, name, tasks:[...], entries:{taskGid:[...]},
-  //                               builtAt, lastAccess }
-  const projCache = new Map();
-  // Per-workspace lists (cheap) + the set of project gids we know exist.
-  const wsMeta = new Map(); // ws → { projects:[{gid,name}], allGids:[...], scanned:bool }
   let meGid = null;
   let building = false;
   let lastError = null;
   let lastRunAt = null;
+  const wsMeta = new Map(); // ws → { projects:[{gid,name}], allGids:[...], scanned }
+
+  // Small parsed-record cache so repeat reads of the same project don't re-parse
+  // the file. Auto-invalidated by file mtime; capped so RAM stays bounded.
+  const parsed = new Map(); // fileKey → { mtimeMs, rec }
+
+  let diskOk = true;
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { diskOk = false; }
+  const memStore = new Map(); // fallback when disk is unavailable: key → rec
+
   const key = (ws, gid) => `${ws}:${gid}`;
+  const fileFor = (ws, gid) => path.join(DATA_DIR, String(ws), String(gid) + '.json');
+
+  /* ── Disk-backed record I/O ────────────────────────────────── */
+  async function readRec(ws, gid) {
+    const fkey = key(ws, gid);
+    if (!diskOk) return memStore.get(fkey) || null;
+    const file = fileFor(ws, gid);
+    let st;
+    try { st = await fsp.stat(file); } catch { return null; }
+    const hot = parsed.get(fkey);
+    if (hot && hot.mtimeMs === st.mtimeMs) return hot.rec;
+    try {
+      const rec = JSON.parse(await fsp.readFile(file, 'utf8'));
+      parsed.set(fkey, { mtimeMs: st.mtimeMs, rec });
+      if (parsed.size > PARSE_CACHE_MAX) parsed.delete(parsed.keys().next().value); // evict oldest
+      return rec;
+    } catch { return null; }
+  }
+  async function writeRec(ws, gid, rec) {
+    const fkey = key(ws, gid);
+    if (!diskOk) { memStore.set(fkey, rec); return; }
+    const file = fileFor(ws, gid);
+    try {
+      await fsp.mkdir(path.dirname(file), { recursive: true });
+      const tmp = file + '.tmp';
+      await fsp.writeFile(tmp, JSON.stringify(rec));
+      await fsp.rename(tmp, file); // atomic replace
+      try { const st = await fsp.stat(file); parsed.set(fkey, { mtimeMs: st.mtimeMs, rec }); } catch { /* ignore */ }
+    } catch (e) { lastError = String(e); }
+  }
+  async function touch(ws, gid) { // mark "recently accessed" (mtime) so prune spares it
+    if (!diskOk) return;
+    const now = new Date();
+    try { await fsp.utimes(fileFor(ws, gid), now, now); } catch { /* ignore */ }
+  }
+  async function existsRec(ws, gid) {
+    if (!diskOk) return memStore.has(key(ws, gid));
+    try { await fsp.stat(fileFor(ws, gid)); return true; } catch { return false; }
+  }
+  async function listCachedGids(ws) {
+    if (!diskOk) return [...memStore.keys()].filter((k) => k.startsWith(ws + ':')).map((k) => k.slice(ws.length + 1));
+    try { return (await fsp.readdir(path.join(DATA_DIR, String(ws)))).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)); }
+    catch { return []; }
+  }
 
   /* ── Global adaptive rate limiter ──────────────────────────────
-   * Serializes request START times to at least `gap` ms apart, so no matter
-   * how many workers run, the overall request rate stays controlled. On a 429
-   * we widen the gap (slow down); on sustained success we narrow it (speed up).
-   * This self-tunes to whatever Asana tier the token is on. */
-  let gap = 80;                 // ms between request starts (~12.5 req/s)
-  const MIN_GAP = 60, MAX_GAP = 2000;
-  let nextAt = 0;
+   * Spaces request START times so overall rate stays controlled regardless of
+   * concurrency. Widens the gap on a 429, narrows it on sustained success —
+   * self-tuning to whatever Asana tier the token is on. */
+  let gap = 80; const MIN_GAP = 60, MAX_GAP = 2000; let nextAt = 0;
   async function gate() {
     const now = Date.now();
     const wait = Math.max(0, nextAt - now);
     nextAt = Math.max(now, nextAt) + gap;
     if (wait) await sleep(wait);
   }
-  function sawRateLimit() { gap = Math.min(MAX_GAP, Math.round(gap * 1.5)); }
-  function sawSuccess() { if (gap > MIN_GAP) gap = Math.max(MIN_GAP, gap - 2); }
 
   /* ── Asana access (throttled, retry on 429 / 5xx) ──────────── */
   async function asanaGet(pathQ) {
@@ -91,14 +143,10 @@ function createSnapshot(opts = {}) {
     for (let attempt = 0; ; attempt++) {
       await gate();
       let res;
-      try {
-        res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-      } catch (e) {
-        if (attempt < 3) { await sleep(700); continue; }
-        throw e;
-      }
+      try { res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } }); }
+      catch (e) { if (attempt < 3) { await sleep(700); continue; } throw e; }
       if (res.status === 429) {
-        sawRateLimit();
+        gap = Math.min(MAX_GAP, Math.round(gap * 1.5));
         const retryAfter = +res.headers.get('retry-after') || 0;
         if (attempt < 8) { await sleep(retryAfter ? retryAfter * 1000 : 1200 * (attempt + 1)); continue; }
       }
@@ -109,15 +157,15 @@ function createSnapshot(opts = {}) {
         const msg = (json.errors && json.errors[0] && json.errors[0].message) || `HTTP ${res.status}`;
         const err = new Error(msg); err.status = res.status; throw err;
       }
-      sawSuccess();
+      if (gap > MIN_GAP) gap = Math.max(MIN_GAP, gap - 2);
       return json;
     }
   }
-  async function asanaAll(path, query) {
+  async function asanaAll(p, query) {
     let out = [], offset = null;
     do {
       const q = query + (offset ? `&offset=${encodeURIComponent(offset)}` : '');
-      const res = await asanaGet(`${path}?${q}`);
+      const res = await asanaGet(`${p}?${q}`);
       out = out.concat(res.data || []);
       offset = res.next_page ? res.next_page.offset : null;
     } while (offset);
@@ -129,7 +177,6 @@ function createSnapshot(opts = {}) {
     await Promise.all(Array.from({ length: Math.min(size, items.length || 1) }, worker));
   }
 
-  /* ── Workspace project list (cheap; refreshed lazily) ──────── */
   async function ensureWsMeta(ws, force) {
     let m = wsMeta.get(ws);
     if (m && m.scanned && !force) return m;
@@ -145,8 +192,7 @@ function createSnapshot(opts = {}) {
     return p ? p.name : gid;
   }
 
-  /* ── Fetch one project's tasks (+ entries for timed tasks) ─── */
-  // `since` (ISO) → incremental merge; null → full (within nothing; all tasks).
+  /* ── Fetch one project's tasks (+ entries) and persist it ──── */
   async function buildProject(ws, gid, since) {
     const name = projNameOf(ws, gid);
     const q = `opt_fields=${TASK_FIELDS}&limit=100` + (since ? `&modified_since=${encodeURIComponent(since)}` : '');
@@ -155,13 +201,12 @@ function createSnapshot(opts = {}) {
     tasks.forEach((t) => {
       const m = (t.memberships || []).find((mm) => mm.project && mm.project.gid === gid) || (t.memberships || [])[0];
       t._section = (m && m.section && m.section.name) || 'No section';
-      t._projectGid = gid;
-      t._projectName = name;
+      t._projectGid = gid; t._projectName = name;
       delete t.memberships;
     });
 
-    const rec = projCache.get(key(ws, gid)) || { ws, gid, name, tasks: [], entries: {}, builtAt: null, lastAccess: Date.now() };
-    rec.name = name;
+    const prior = (since ? await readRec(ws, gid) : null) || { ws, gid, name, tasks: [], entries: {} };
+    const rec = { ws, gid, name, tasks: prior.tasks || [], entries: prior.entries || {}, builtAt: null };
     if (since) {
       const map = new Map(rec.tasks.map((t) => [t.gid, t]));
       tasks.forEach((t) => map.set(t.gid, t));
@@ -170,7 +215,6 @@ function createSnapshot(opts = {}) {
       rec.tasks = tasks;
     }
 
-    // Time entries only for the tasks we just pulled that have logged time.
     const timed = tasks.filter((t) => (t.actual_time_minutes || 0) > 0);
     await mapPool(timed, CONCURRENCY, async (t) => {
       try {
@@ -178,60 +222,60 @@ function createSnapshot(opts = {}) {
         rec.entries[t.gid] = res.data || [];
       } catch { /* keep any prior entries */ }
     });
-    // Drop entries for tasks no longer present (keeps memory tidy / no dupes).
     const live = new Set(rec.tasks.map((t) => t.gid));
     for (const tg of Object.keys(rec.entries)) if (!live.has(tg)) delete rec.entries[tg];
 
     rec.builtAt = new Date().toISOString();
-    projCache.set(key(ws, gid), rec);
+    await writeRec(ws, gid, rec);
     return rec;
   }
 
-  /* ── Public: return the ALREADY-cached part of a scope immediately ──
-   * Returns { ready, building, builtAt, tasks:[...], entries:{...}, have:[gids],
-   * missing:[gids] } right away — it NEVER blocks fetching from Asana. Projects
-   * not cached yet come back in `missing` (the browser live-fetches those, with
-   * its own progress + instant estimate) and are warmed in the BACKGROUND so the
-   * next open is instant. This keeps the request fast no matter how many
-   * projects (or a whole person's worth) were selected. */
-  function ensureScope(ws, gids) {
+  /* ── Public: return the ALREADY-cached part of a scope ─────────
+   * Reads cached projects from disk (fast, local) and returns them right away;
+   * never blocks on Asana. Not-yet-cached projects come back in `missing` (the
+   * browser live-fetches those) and are warmed in the background for next time.
+   * Works for ANY device — the data lives on the server, not the browser. */
+  async function ensureScope(ws, gids) {
     if (!token) return { ready: false, tasks: [], entries: {}, have: [], missing: gids };
     const tasks = [], entries = {}, have = [], missing = [];
-    gids.forEach((g) => {
-      const rec = projCache.get(key(ws, g));
+    let builtAt = null;
+    await mapPool(gids, 12, async (g) => {
+      const rec = await readRec(ws, g);
       if (rec && rec.builtAt) {
-        rec.lastAccess = Date.now();
         rec.tasks.forEach((t) => tasks.push(t));
         Object.assign(entries, rec.entries);
         have.push(g);
+        if (!builtAt || rec.builtAt > builtAt) builtAt = rec.builtAt;
+        touch(ws, g); // fire-and-forget access stamp
       } else {
         missing.push(g);
       }
     });
-    if (missing.length) warmInBackground(ws, missing); // grow coverage without blocking
-    return { ready: have.length > 0, building, builtAt: newestBuiltAt(ws, have), tasks, entries, have, missing, day: istCacheDay() };
+    if (missing.length) warmInBackground(ws, missing);
+    return { ready: have.length > 0, building, builtAt, tasks, entries, have, missing, day: istCacheDay() };
   }
 
   /* ── Background warmer ─────────────────────────────────────────
-   * Projects that were requested but not cached get fetched one at a time in the
-   * background (sharing the global rate limiter), so they're instant next time.
-   * "Pre-load everything over time", driven by what people actually open. */
-  const warmQueue = new Set(); // `${ws}:${gid}` pending
+   * Requested-but-uncached projects get fetched one at a time in the background
+   * (sharing the rate limiter) and persisted, so they're instant next time — on
+   * every device. This is what grows coverage toward "everything" from normal
+   * use, on top of the nightly back-fill. */
+  const warmQueue = new Set();
   const inFlight = new Set();
   let warming = false;
   function warmInBackground(ws, gids) {
-    gids.forEach((g) => { const k = key(ws, g); if (!inFlight.has(k) && !projCache.has(k)) warmQueue.add(k); });
+    gids.forEach((g) => { const k = key(ws, g); if (!inFlight.has(k)) warmQueue.add(k); });
     if (!warming) drainWarm();
   }
   async function drainWarm() {
     warming = true;
     try {
       while (warmQueue.size) {
-        const k = warmQueue.values().next().value;
-        warmQueue.delete(k);
-        if (inFlight.has(k) || projCache.has(k)) continue;
-        inFlight.add(k);
+        const k = warmQueue.values().next().value; warmQueue.delete(k);
+        if (inFlight.has(k)) continue;
         const i = k.indexOf(':'), ws = k.slice(0, i), gid = k.slice(i + 1);
+        if (await existsRec(ws, gid)) continue;
+        inFlight.add(k);
         try { await ensureWsMeta(ws).catch(() => {}); await buildProject(ws, gid, null); }
         catch (e) { lastError = String(e); }
         finally { inFlight.delete(k); }
@@ -239,13 +283,7 @@ function createSnapshot(opts = {}) {
     } finally { warming = false; }
   }
 
-  function newestBuiltAt(ws, gids) {
-    let newest = null;
-    gids.forEach((g) => { const r = projCache.get(key(ws, g)); if (r && r.builtAt && (!newest || r.builtAt > newest)) newest = r.builtAt; });
-    return newest;
-  }
-
-  /* ── Nightly refresh: update cached projects + grow coverage ── */
+  /* ── Nightly refresh: keep cached fresh + complete coverage ──── */
   async function refreshAll() {
     if (building || !token) return;
     building = true; lastError = null;
@@ -260,26 +298,31 @@ function createSnapshot(opts = {}) {
         const ws = w.gid;
         await ensureWsMeta(ws, true).catch(() => {});
 
-        // 1) Prune projects nobody has opened in a while (bound memory).
-        const cutoff = Date.now() - PRUNE_DAYS * DAY;
-        for (const [k, rec] of projCache) if (rec.ws === ws && rec.lastAccess < cutoff) projCache.delete(k);
+        // 1) Prune projects nobody has opened in a while (bound disk).
+        if (diskOk) {
+          const cutoff = Date.now() - PRUNE_DAYS * DAY;
+          for (const gid of await listCachedGids(ws)) {
+            try { const st = await fsp.stat(fileFor(ws, gid)); if (st.mtimeMs < cutoff) { await fsp.unlink(fileFor(ws, gid)); parsed.delete(key(ws, gid)); } } catch { /* ignore */ }
+          }
+        }
 
-        // 2) Incrementally refresh everything still cached for this workspace.
-        const cached = [...projCache.values()].filter((r) => r.ws === ws);
-        await mapPool(cached, CONCURRENCY, async (rec) => {
-          try { await buildProject(ws, rec.gid, sinceBase); } catch (e) { lastError = String(e); }
+        // 2) Incrementally refresh everything already cached for this workspace.
+        const cached = await listCachedGids(ws);
+        await mapPool(cached, CONCURRENCY, async (gid) => {
+          try { await buildProject(ws, gid, sinceBase); } catch (e) { lastError = String(e); }
         });
 
-        // 3) Back-fill a few not-yet-cached projects so coverage grows toward
-        //    "everything" over successive nights — without hammering Asana.
+        // 3) Back-fill EVERY not-yet-cached project so coverage becomes complete
+        //    (so a fresh device is instant on anything). Throttled by the limiter.
         const meta = wsMeta.get(ws);
-        const uncached = (meta ? meta.allGids : []).filter((g) => !projCache.has(key(ws, g))).slice(0, BACKFILL_PER_RUN);
-        await mapPool(uncached, Math.min(CONCURRENCY, 4), async (g) => {
-          try { await buildProject(ws, g, null); } catch (e) { lastError = String(e); }
+        const cachedSet = new Set(cached);
+        const uncached = (meta ? meta.allGids : []).filter((g) => !cachedSet.has(String(g)));
+        await mapPool(uncached, CONCURRENCY, async (gid) => {
+          try { await buildProject(ws, gid, null); } catch (e) { lastError = String(e); }
         });
       }
       lastRunAt = runStart;
-      console.log(`  📸 Cache refresh done in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${projCache.size} project(s) cached, gap ${gap}ms, day ${istCacheDay()}.`);
+      console.log(`  📸 Cache refresh done in ${((Date.now() - t0) / 1000).toFixed(1)}s — gap ${gap}ms, day ${istCacheDay()}.`);
     } catch (e) {
       lastError = String(e);
       console.log(`  ⚠  Cache refresh failed: ${lastError}`);
@@ -288,13 +331,14 @@ function createSnapshot(opts = {}) {
     }
   }
 
-  function status(ws) {
-    const recs = [...projCache.values()].filter((r) => !ws || r.ws === ws);
+  async function status(ws) {
+    let cachedProjects = 0;
+    try { cachedProjects = ws ? (await listCachedGids(ws)).length : 0; } catch { /* ignore */ }
     const meta = ws ? wsMeta.get(ws) : null;
     return {
-      cachedProjects: recs.length,
-      knownProjects: meta ? meta.allGids.length : null,
-      building, lastRunAt, lastError, gapMs: gap, day: istCacheDay(),
+      cachedProjects, knownProjects: meta ? meta.allGids.length : null,
+      building, warming, queued: warmQueue.size, lastRunAt, lastError, gapMs: gap,
+      diskOk, dataDir: DATA_DIR, day: istCacheDay(),
     };
   }
 
