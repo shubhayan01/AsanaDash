@@ -66,24 +66,47 @@ Railway auto-detects the Node app (via `railway.json` / Nixpacks) and runs `npm 
 
    **Do not set `PORT`** — Railway injects it automatically.
 
-3. **Generate a domain** (Railway → *Settings → Networking → Generate Domain*), open it, and log in.
+3. **Add a persistent volume for the cache (important).** Railway → your service →
+   *Settings → Volumes → New Volume*, mount it at **`/data`**. Then add one more
+   variable:
+
+   | Variable | Value |
+   |---|---|
+   | `ASANA_CACHE_DIR` | `/data/asana-cache` |
+
+   This is what makes the server's data cache **survive redeploys**, so every
+   device — including a brand-new browser or incognito window — loads instantly.
+   Without a volume the cache still works, but each redeploy wipes it and the
+   server has to warm up again (a new browser will see a live fetch until it does).
+
+4. **Generate a domain** (Railway → *Settings → Networking → Generate Domain*), open it, and log in.
 
 > The session store is in-memory, so a redeploy logs you out (just log back in). That's fine for single-user use.
 
-### Daily auto-refresh (12:00 AM IST)
+### How the cache works (instant loads on any device)
 
-The dashboard caches Asana data on two levels so it loads fast and doesn't re-scrape
-constantly:
+The heavy data lives in a **server-side cache on disk**, shared by every device —
+so you never depend on a particular browser's local storage. You don't fetch
+anything manually; it fills in automatically:
 
-- **Server cache** — successful Asana reads are memoised in the Node process.
-- **Browser cache** — processed tasks/time-entries are stored in IndexedDB.
+- **On first open** — the first time anyone opens a project, the browser does that
+  one live fetch and the **server stores the project on disk** in the background.
+  Every later open of that project — on any device, including incognito — is
+  instant, served straight from the server cache.
+- **Nightly at 12:00 AM IST** — a `node-cron` job re-pulls only what **changed**
+  since the last run for cached projects, **back-fills every project that isn't
+  cached yet** (so even never-opened projects become instant), and drops projects
+  nobody has opened in 90 days so the cache stays bounded.
 
-Both are **wiped automatically every day at 12:00 AM India Standard Time**: an
-in-process `node-cron` job clears the server cache (dropping the previous day's
-data so memory never grows without bound), and the browser drops its IndexedDB
-cache the next time you open the app on a new IST day (it checks `/api/cache-day`).
-So every day starts from **fresh Asana data**, and old data is discarded to save
-space. The ⟳ **Refresh** button still forces an immediate re-scrape any time.
+All scraping is behind a **global rate limiter** that self-tunes to your Asana
+plan, so the nightly full back-fill never trips Asana's rate limits (it just takes
+a while the first time, then stays fast via incremental updates). The ⟳ **Refresh**
+button still forces an immediate re-scrape of the current scope any time.
+
+> **First warm-up after a deploy takes a while.** With a large workspace the very
+> first full back-fill is tens of thousands of Asana calls (throttled), so give it
+> time to complete in the background. With the volume above, it only has to do that
+> once — after that the cache persists and nightly updates are incremental.
 
 ## How the keys stay safe
 
