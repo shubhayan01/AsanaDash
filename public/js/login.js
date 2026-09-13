@@ -10,7 +10,7 @@ fetch('/api/me')
   .then((r) => r.json())
   .then((data) => {
     if (data.authenticated) {
-      window.location.href = '/';
+      window.location.href = data.role === 'dev' ? '/dev.html' : '/';
       return;
     }
     // Warn if the server is missing its keys, so login isn't a mystery.
@@ -41,7 +41,7 @@ form.addEventListener('submit', async (e) => {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Login failed');
-    window.location.href = '/';
+    window.location.href = data.role === 'dev' ? '/dev.html' : '/';
   } catch (err) {
     errEl.hidden = false;
     errEl.textContent = err.message;

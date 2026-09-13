@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Developer · Asana Dash</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/style.css" />
+  <style>
+    .dev-wrap { width: min(640px, 92vw); margin: 0 auto; }
+    .dev-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 22px; padding: 34px 32px; box-shadow: var(--shadow); }
+    .dev-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 6px; }
+    .dev-badge { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); background: var(--accent-soft); padding: 5px 10px; border-radius: 999px; }
+    .dev-card h1 { font-size: 22px; margin: 8px 0 4px; }
+    .dev-sub { color: var(--text-dim); font-size: 14px; line-height: 1.5; margin-bottom: 22px; }
+    .dev-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+    .dev-row label { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; display: block; margin-bottom: 5px; }
+    .dev-select { padding: 10px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--bg-elev-2); color: var(--text); font-size: 14px; min-width: 220px; }
+    .dev-btn { padding: 14px 20px; border-radius: var(--radius-sm); background: var(--accent-grad); color: #fff; font-weight: 700; font-size: 15px; width: 100%; }
+    .dev-btn:disabled { opacity: .6; cursor: default; }
+    .progress { height: 12px; border-radius: 999px; background: var(--bg-elev-2); border: 1px solid var(--border); overflow: hidden; margin: 18px 0 10px; }
+    .progress > span { display: block; height: 100%; width: 0; background: var(--accent-grad); transition: width .4s ease; }
+    .progress.indet > span { width: 40%; animation: slide 1.2s ease-in-out infinite; }
+    @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
+    .stat { background: var(--bg-elev-2); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 12px 14px; }
+    .stat b { display: block; font-size: 20px; font-weight: 700; }
+    .stat span { font-size: 12px; color: var(--text-dim); }
+    .dev-status { font-size: 13px; color: var(--text-dim); margin-top: 8px; min-height: 18px; }
+    .dev-status.err { color: var(--danger); }
+    .dev-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
+    .dev-foot a { color: var(--accent); font-weight: 600; }
+    .dev-note { font-size: 12px; color: var(--text-faint); line-height: 1.5; margin-top: 14px; }
+  </style>
+</head>
+<body class="login-body">
+  <div class="dev-wrap">
+    <main class="dev-card">
+      <div class="dev-head">
+        <span class="dev-badge">Developer</span>
+        <span id="dev-user" class="muted"></span>
+      </div>
+      <h1>Data preloader</h1>
+      <p class="dev-sub">Fetch every project's tasks and time entries and save them to the server. Once this finishes, everyone who logs in opens their reports instantly — no waiting for Asana.</p>
+
+      <div class="dev-row">
+        <div>
+          <label for="ws">Workspace</label>
+          <select id="ws" class="dev-select"></select>
+        </div>
+      </div>
+
+      <button id="fetch-btn" class="dev-btn">⬇  Fetch &amp; save all data now</button>
+
+      <div class="progress" id="bar" hidden><span></span></div>
+
+      <div class="stat-grid">
+        <div class="stat"><b id="s-cached">—</b><span>Projects saved</span></div>
+        <div class="stat"><b id="s-known">—</b><span>Projects total</span></div>
+      </div>
+
+      <p class="dev-status" id="status"></p>
+      <p class="dev-note" id="note"></p>
+
+      <div class="dev-foot">
+        <a href="/">Open the dashboard →</a>
+        <button id="logout" class="link-btn">Log out</button>
+      </div>
+    </main>
+  </div>
+  <script src="/js/dev.js"></script>
+</body>
+</html>

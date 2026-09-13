@@ -32,6 +32,10 @@ const ASANA_TOKEN = process.env.ASANA_TOKEN || '';
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || '';
+// Developer login: a separate, privileged account that can pre-fetch and save
+// all Asana data to the server cache so ordinary users open reports instantly.
+const DEV_USER = process.env.DEV_USER || '';
+const DEV_PASS = process.env.DEV_PASS || '';
 
 const ASANA_BASE = 'https://app.asana.com/api/1.0';
 const GROQ_BASE = 'https://api.groq.com/openai/v1';
@@ -123,6 +127,15 @@ function requireAuth(req, res, next) {
   return res.status(401).set('X-Auth-Required', '1').json({ error: 'Not authenticated' });
 }
 
+// Only the developer account may trigger a full pre-fetch. A logged-in
+// non-dev gets a plain 403 (no X-Auth-Required header) so the frontend
+// doesn't mistake it for a logout and bounce to the login page.
+function requireDev(req, res, next) {
+  if (req.session && req.session.user && req.session.role === 'dev') return next();
+  if (req.session && req.session.user) return res.status(403).json({ error: 'Developer access required' });
+  return res.status(401).set('X-Auth-Required', '1').json({ error: 'Not authenticated' });
+}
+
 // Forward a request to an upstream API, injecting the auth header.
 // When `cacheKey` is given, a successful GET is served from / stored in
 // the daily-expiring server cache.
@@ -167,15 +180,21 @@ async function proxy(res, url, { method = 'GET', token, body, cacheKey } = {}) {
 
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
-  const ok =
-    ADMIN_PASS.length > 0 &&
-    safeEqual(username || '', ADMIN_USER) &&
-    safeEqual(password || '', ADMIN_PASS);
+  const u = username || '', p = password || '';
 
-  if (!ok) return res.status(401).json({ error: 'Invalid username or password' });
-
-  req.session.user = ADMIN_USER;
-  res.json({ ok: true, user: ADMIN_USER });
+  // Developer account first (privileged: can pre-fetch & save all data).
+  if (DEV_PASS.length > 0 && safeEqual(u, DEV_USER) && safeEqual(p, DEV_PASS)) {
+    req.session.user = DEV_USER;
+    req.session.role = 'dev';
+    return res.json({ ok: true, user: DEV_USER, role: 'dev' });
+  }
+  // Regular dashboard user.
+  if (ADMIN_PASS.length > 0 && safeEqual(u, ADMIN_USER) && safeEqual(p, ADMIN_PASS)) {
+    req.session.user = ADMIN_USER;
+    req.session.role = 'user';
+    return res.json({ ok: true, user: ADMIN_USER, role: 'user' });
+  }
+  return res.status(401).json({ error: 'Invalid username or password' });
 });
 
 app.post('/api/logout', (req, res) => {
@@ -188,6 +207,7 @@ app.get('/api/me', (req, res) => {
   res.json({
     authenticated: !!(req.session && req.session.user),
     user: req.session ? req.session.user : null,
+    role: req.session ? (req.session.role || 'user') : null,
     config: {
       asana: ASANA_TOKEN.length > 0,
       groq: GROQ_API_KEY.length > 0,
@@ -246,6 +266,19 @@ app.post('/api/cached-scope', requireAuth, async (req, res) => {
 app.get('/api/cache-status', requireAuth, async (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json(await snapshot.status(req.query.workspace));
+});
+
+// Developer-only: fetch EVERY project's tasks + time entries and SAVE them to
+// the server cache, so afterwards any user opens any report with zero waiting.
+// Fire-and-forget — it runs in the background; the dev page polls
+// /api/cache-status to watch progress. Safe to click again; it no-ops while a
+// run is already in flight.
+app.post('/api/prefetch', requireDev, (req, res) => {
+  if (!ASANA_TOKEN) return res.status(500).json({ error: 'ASANA_TOKEN not configured in .env' });
+  res.set('Cache-Control', 'no-store');
+  if (snapshot.isBuilding()) return res.json({ started: false, building: true });
+  snapshot.refreshAll(); // runs in the background
+  res.json({ started: true, building: true });
 });
 
 /* ─── Groq proxy ────────────────────────────────────────────── */

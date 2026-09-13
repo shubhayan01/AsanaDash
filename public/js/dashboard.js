@@ -122,6 +122,11 @@ async function boot() {
   if (!me.authenticated) { window.location.href = '/login.html'; return; }
   state.config = me.config;
   $('#user-label').textContent = me.user || ''; $('#user-avatar').textContent = initials(me.user);
+  // Developer accounts get a shortcut back to the data preloader.
+  if (me.role === 'dev' && !$('#dev-link')) {
+    const a = document.createElement('a'); a.id = 'dev-link'; a.href = '/dev.html'; a.className = 'link-btn'; a.textContent = 'Preloader'; a.title = 'Fetch & save all data';
+    const pill = $('#logout-btn'); if (pill && pill.parentNode) pill.parentNode.insertBefore(a, pill);
+  }
   $('#gate').hidden = true; $('#app').hidden = false;
   if (!me.config.asana) { banner('Asana token not configured (.env → ASANA_TOKEN). Add it and restart.', 'error'); return; }
 
