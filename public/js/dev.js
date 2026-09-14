@@ -19,6 +19,7 @@ async function apiJson(url, opts) {
 
 const wsSel = $('#ws');
 const btn = $('#fetch-btn');
+const purgeBtn = $('#purge-btn');
 const bar = $('#bar');
 const barFill = bar.querySelector('span');
 const statusEl = $('#status');
@@ -55,6 +56,7 @@ async function boot() {
 
   wsSel.addEventListener('change', () => refreshStatus());
   btn.addEventListener('click', startFetch);
+  purgeBtn.addEventListener('click', startPurge);
   $('#logout').addEventListener('click', async () => { await fetch('/api/logout', { method: 'POST' }); location.href = '/login.html'; });
 
   await refreshStatus();
@@ -70,6 +72,20 @@ async function startFetch() {
   } catch (e) {
     setStatus('Could not start: ' + e.message, true);
     btn.disabled = false;
+    return;
+  }
+  startPolling();
+}
+
+async function startPurge() {
+  if (!confirm('Delete ALL cached data on the server and re-download it fresh (only Jan 2026 → now)?\n\nReports may be slower until the rebuild finishes.')) return;
+  btn.disabled = true; purgeBtn.disabled = true;
+  setStatus('Deleting old data and starting a fresh download…');
+  try {
+    await apiJson('/api/purge-cache', { method: 'POST' });
+  } catch (e) {
+    setStatus('Could not purge: ' + e.message, true);
+    btn.disabled = false; purgeBtn.disabled = false;
     return;
   }
   startPolling();
@@ -105,7 +121,9 @@ async function refreshStatus() {
   }
 
   btn.disabled = active;
+  purgeBtn.disabled = active;
   btn.textContent = active ? '⏳  Fetching…' : (cached > 0 ? '↻  Fetch again / update' : '⬇  Fetch & save all data now');
+  if (s.since) { const el = $('#since-note'); if (el) el.textContent = `Only data from ${fmtSince(s.since)} onward is fetched.`; }
 
   if (s.lastError) { setStatus('Last error: ' + s.lastError, true); }
   else if (s.building) { setStatus(`Fetching from Asana… ${cached}${known ? ' / ' + known : ''} projects saved so far.`); }
@@ -126,6 +144,7 @@ async function refreshStatus() {
 /* ── tiny utils ── */
 function escapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function fmtWhen(iso) { try { return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); } catch { return iso; } }
+function fmtSince(iso) { try { return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }); } catch { return iso; } }
 function applyTheme() {
   try {
     const s = JSON.parse(localStorage.getItem('asanaDash.v4') || '{}');

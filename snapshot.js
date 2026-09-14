@@ -57,6 +57,20 @@ function istCacheDay() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
 }
 
+// Normalise a "fetch since" value (a plain YYYY-MM-DD like "2026-01-01", or a
+// full ISO timestamp) into an ISO 8601 string Asana's `modified_since` accepts.
+function normSince(v) {
+  const d = new Date(v);
+  if (isNaN(d)) return new Date('2026-01-01T00:00:00.000Z').toISOString();
+  return d.toISOString();
+}
+// Return the later of two ISO timestamps (either may be null/empty).
+function maxSince(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return Date.parse(a) >= Date.parse(b) ? a : b;
+}
+
 function createSnapshot(opts = {}) {
   const token = opts.token || '';
   // Tunables (env-overridable). Defaults stay well under Asana's rate limits.
@@ -67,6 +81,10 @@ function createSnapshot(opts = {}) {
   // the cache silently lands off the mounted volume, on ephemeral disk.
   const DATA_DIR = (opts.dataDir || process.env.ASANA_CACHE_DIR || path.join(__dirname, '.cache')).trim();
   const PARSE_CACHE_MAX = +opts.parseCacheMax || 120; // hot projects kept parsed in RAM
+  // Only fetch tasks touched on/after this date (Asana `modified_since`). Keeps
+  // the cache to recent work (default: Jan 2026 onward) instead of the full,
+  // years-deep history — far less to download, store, and ship to the browser.
+  const SINCE_FLOOR = normSince(opts.since || process.env.FETCH_SINCE || '2026-01-01');
 
   let meGid = null;
   let building = false;
@@ -198,7 +216,10 @@ function createSnapshot(opts = {}) {
   /* ── Fetch one project's tasks (+ entries) and persist it ──── */
   async function buildProject(ws, gid, since) {
     const name = projNameOf(ws, gid);
-    const q = `opt_fields=${TASK_FIELDS}&limit=100` + (since ? `&modified_since=${encodeURIComponent(since)}` : '');
+    // Never fetch earlier than the floor: a full fetch (since=null) uses the
+    // floor; an incremental fetch uses the later of its base and the floor.
+    const eff = maxSince(since, SINCE_FLOOR);
+    const q = `opt_fields=${TASK_FIELDS}&limit=100&modified_since=${encodeURIComponent(eff)}`;
     let tasks;
     try { tasks = await asanaAll(`projects/${gid}/tasks`, q); } catch { tasks = []; }
     tasks.forEach((t) => {
@@ -334,6 +355,22 @@ function createSnapshot(opts = {}) {
     }
   }
 
+  /* ── Delete EVERYTHING cached (so the next refresh rebuilds clean) ────
+   * Used to drop the old, pre-floor data on demand ("delete the earlier data")
+   * so a fresh, floored full fetch replaces it. Resets lastRunAt so the next
+   * refreshAll does a full (not incremental) pull. */
+  async function purgeAll() {
+    parsed.clear();
+    memStore.clear();
+    lastRunAt = null;
+    wsMeta.clear();
+    if (diskOk) {
+      try { await fsp.rm(DATA_DIR, { recursive: true, force: true }); } catch (e) { lastError = String(e); }
+      try { await fsp.mkdir(DATA_DIR, { recursive: true }); } catch { diskOk = false; }
+    }
+    return true;
+  }
+
   async function status(ws) {
     let cachedProjects = 0;
     try { cachedProjects = ws ? (await listCachedGids(ws)).length : 0; } catch { /* ignore */ }
@@ -341,11 +378,11 @@ function createSnapshot(opts = {}) {
     return {
       cachedProjects, knownProjects: meta ? meta.allGids.length : null,
       building, warming, queued: warmQueue.size, lastRunAt, lastError, gapMs: gap,
-      diskOk, dataDir: DATA_DIR, day: istCacheDay(),
+      diskOk, dataDir: DATA_DIR, day: istCacheDay(), since: SINCE_FLOOR,
     };
   }
 
-  return { ensureScope, refreshAll, status, isBuilding: () => building, lastError: () => lastError, istCacheDay };
+  return { ensureScope, refreshAll, purgeAll, status, isBuilding: () => building, lastError: () => lastError, istCacheDay, since: () => SINCE_FLOOR };
 }
 
 module.exports = { createSnapshot, istCacheDay };

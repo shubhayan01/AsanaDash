@@ -32,6 +32,10 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': 
 const initials = (n) => !n ? '?' : n.trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const DAY = 86400000;
+// Only live-fetch tasks touched on/after this floor (mirrors the server's
+// FETCH_SINCE, so the browser fallback stays in sync). Overwritten in boot()
+// from /api/me config. Default: Jan 2026 → now.
+let FETCH_SINCE_ISO = '2026-01-01T00:00:00.000Z';
 const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 function fmtDuration(min) { min = Math.round(min || 0); if (!min) return '0m'; const h = Math.floor(min / 60), m = min % 60; return h ? (m ? `${h}h ${m}m` : `${h}h`) : `${m}m`; }
@@ -100,6 +104,20 @@ async function idbClearAll() { try { const db = await idb(); await new Promise((
  * IndexedDB — so we no longer wipe the local cache on a new day (that only made
  * mornings slow). We just record the day for reference. */
 const CACHE_DAY_KEY = 'asanaDash.cacheDay';
+
+/* One-time local-cache migration: when the data policy changes (e.g. the Jan
+ * 2026 fetch floor), old IndexedDB entries can still hold pre-floor tasks. Wipe
+ * the local cache once per policy version so it repopulates with floored data. */
+const CACHE_VER_KEY = 'asanaDash.cacheVer';
+const CACHE_VER = 'since-2026-01';
+async function migrateCache() {
+  let v = null;
+  try { v = localStorage.getItem(CACHE_VER_KEY); } catch { /* ignore */ }
+  if (v === CACHE_VER) return;
+  await idbClearAll();
+  try { localStorage.setItem(CACHE_VER_KEY, CACHE_VER); } catch { /* ignore */ }
+}
+
 async function enforceCacheDay() {
   let day;
   try { day = (await apiJson('/api/cache-day')).day; } catch { return; }
@@ -121,6 +139,7 @@ async function boot() {
   let me; try { me = await apiJson('/api/me'); } catch { window.location.href = '/login.html'; return; }
   if (!me.authenticated) { window.location.href = '/login.html'; return; }
   state.config = me.config;
+  if (me.config && me.config.fetchSince) { const d = new Date(me.config.fetchSince); if (!isNaN(d)) FETCH_SINCE_ISO = d.toISOString(); }
   $('#user-label').textContent = me.user || ''; $('#user-avatar').textContent = initials(me.user);
   // Developer accounts get a shortcut back to the data preloader.
   if (me.role === 'dev' && !$('#dev-link')) {
@@ -130,6 +149,7 @@ async function boot() {
   $('#gate').hidden = true; $('#app').hidden = false;
   if (!me.config.asana) { banner('Asana token not configured (.env → ASANA_TOKEN). Add it and restart.', 'error'); return; }
 
+  await migrateCache();    // drop pre-2026 local cache once, so it repopulates floored
   await enforceCacheDay(); // drop stale cache once the IST day has rolled over
 
   try {
@@ -306,7 +326,7 @@ const TASK_FIELDS = ['name', 'completed', 'completed_at', 'created_at', 'due_on'
 
 async function getProjectTasks(projectGid, name) {
   if (state.cache.projectTasks[projectGid]) return state.cache.projectTasks[projectGid];
-  const tasks = await asanaAll(`projects/${projectGid}/tasks`, `opt_fields=${TASK_FIELDS}&limit=100`);
+  const tasks = await asanaAll(`projects/${projectGid}/tasks`, `opt_fields=${TASK_FIELDS}&limit=100&modified_since=${encodeURIComponent(FETCH_SINCE_ISO)}`);
   tasks.forEach((t) => { const m = (t.memberships || []).find((mm) => mm.project && mm.project.gid === projectGid) || (t.memberships || [])[0]; t._section = (m && m.section && m.section.name) || 'No section'; t._projectGid = projectGid; t._projectName = name; });
   state.cache.projectTasks[projectGid] = tasks;
   state.net.tasks++;                                              // network fetch (not cache)

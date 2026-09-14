@@ -36,6 +36,9 @@ const ADMIN_PASS = process.env.ADMIN_PASS || '';
 // all Asana data to the server cache so ordinary users open reports instantly.
 const DEV_USER = process.env.DEV_USER || '';
 const DEV_PASS = process.env.DEV_PASS || '';
+// Only fetch/store Asana data touched on/after this date (default: Jan 2026 →
+// now). Keeps the cache small and recent instead of the full years-deep history.
+const FETCH_SINCE = process.env.FETCH_SINCE || '2026-01-01';
 
 const ASANA_BASE = 'https://app.asana.com/api/1.0';
 const GROQ_BASE = 'https://api.groq.com/openai/v1';
@@ -99,7 +102,7 @@ function ensureFreshDay() {
  * (only tasks changed since the last run), so we fetch just the last day's
  * data and never re-download what we already have.
  */
-const snapshot = createSnapshot({ token: ASANA_TOKEN });
+const snapshot = createSnapshot({ token: ASANA_TOKEN, since: FETCH_SINCE });
 
 // Every night at 12:00 AM IST: drop the thin URL-passthrough cache AND refresh
 // the pre-loaded snapshot, so the morning starts from fresh Asana data.
@@ -211,6 +214,7 @@ app.get('/api/me', (req, res) => {
     config: {
       asana: ASANA_TOKEN.length > 0,
       groq: GROQ_API_KEY.length > 0,
+      fetchSince: FETCH_SINCE, // client mirrors this floor on its live-fetch fallback
     },
   });
 });
@@ -279,6 +283,23 @@ app.post('/api/prefetch', requireDev, (req, res) => {
   if (snapshot.isBuilding()) return res.json({ started: false, building: true });
   snapshot.refreshAll(); // runs in the background
   res.json({ started: true, building: true });
+});
+
+// Developer-only: DELETE all cached data (the old, pre-floor history) and then
+// re-download it fresh, floored to FETCH_SINCE. This is how the earlier data on
+// the server (e.g. Railway's cache volume) is wiped and replaced without shell
+// access. Rebuild runs in the background; the dev page polls /api/cache-status.
+app.post('/api/purge-cache', requireDev, async (req, res) => {
+  if (!ASANA_TOKEN) return res.status(500).json({ error: 'ASANA_TOKEN not configured in .env' });
+  res.set('Cache-Control', 'no-store');
+  try {
+    await snapshot.purgeAll();  // delete the disk-backed per-project cache
+    purgeCache('developer purge & rebuild'); // also drop the URL passthrough cache
+    snapshot.refreshAll();      // re-download from scratch, floored to FETCH_SINCE
+    res.json({ purged: true, building: true });
+  } catch (e) {
+    res.status(502).json({ error: 'purge failed', detail: String(e) });
+  }
 });
 
 /* ─── Groq proxy ────────────────────────────────────────────── */

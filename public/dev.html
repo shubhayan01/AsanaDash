@@ -20,6 +20,8 @@
     .dev-select { padding: 10px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--bg-elev-2); color: var(--text); font-size: 14px; min-width: 220px; }
     .dev-btn { padding: 14px 20px; border-radius: var(--radius-sm); background: var(--accent-grad); color: #fff; font-weight: 700; font-size: 15px; width: 100%; }
     .dev-btn:disabled { opacity: .6; cursor: default; }
+    .dev-btn.ghost { background: transparent; color: var(--danger); border: 1px solid var(--border); font-weight: 600; font-size: 13px; margin-top: 10px; }
+    .dev-btn.ghost:hover:not(:disabled) { border-color: var(--danger); }
     .progress { height: 12px; border-radius: 999px; background: var(--bg-elev-2); border: 1px solid var(--border); overflow: hidden; margin: 18px 0 10px; }
     .progress > span { display: block; height: 100%; width: 0; background: var(--accent-grad); transition: width .4s ease; }
     .progress.indet > span { width: 40%; animation: slide 1.2s ease-in-out infinite; }
@@ -43,7 +45,7 @@
         <span id="dev-user" class="muted"></span>
       </div>
       <h1>Data preloader</h1>
-      <p class="dev-sub">Fetch every project's tasks and time entries and save them to the server. Once this finishes, everyone who logs in opens their reports instantly — no waiting for Asana.</p>
+      <p class="dev-sub">Fetch every project's tasks and time entries and save them to the server. Once this finishes, everyone who logs in opens their reports instantly — no waiting for Asana. <span id="since-note" class="muted"></span></p>
 
       <div class="dev-row">
         <div>
@@ -53,6 +55,7 @@
       </div>
 
       <button id="fetch-btn" class="dev-btn">⬇  Fetch &amp; save all data now</button>
+      <button id="purge-btn" class="dev-btn ghost">🗑  Delete old data &amp; re-download fresh</button>
 
       <div class="progress" id="bar" hidden><span></span></div>
 
