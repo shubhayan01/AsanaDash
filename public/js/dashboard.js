@@ -94,6 +94,10 @@ function idb() {
   return _dbPromise;
 }
 async function idbSet(key, val) { try { const db = await idb(); await new Promise((res, rej) => { const tx = db.transaction(STORE, 'readwrite'); tx.objectStore(STORE).put(val, key); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch { /* memory-only fallback */ } }
+// Write many key/value pairs in ONE transaction. Persisting a big pre-loaded
+// scope with a separate idbSet() per task would open tens of thousands of
+// transactions and freeze weak laptops; this does it in a single tx instead.
+async function idbSetMany(pairs) { if (!pairs || !pairs.length) return; try { const db = await idb(); await new Promise((res, rej) => { const tx = db.transaction(STORE, 'readwrite'); const st = tx.objectStore(STORE); for (const [k, v] of pairs) st.put(v, k); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch { /* memory-only fallback */ } }
 async function idbGetPrefix(prefix) { try { const db = await idb(); return await new Promise((res, rej) => { const out = {}; const cur = db.transaction(STORE, 'readonly').objectStore(STORE).openCursor(); cur.onsuccess = (e) => { const c = e.target.result; if (c) { if (String(c.key).startsWith(prefix)) out[c.key] = c.value; c.continue(); } else res(out); }; cur.onerror = () => rej(cur.error); }); } catch { return {}; } }
 async function idbDeletePrefix(prefix) { try { const db = await idb(); await new Promise((res, rej) => { const tx = db.transaction(STORE, 'readwrite'); const st = tx.objectStore(STORE); const cur = st.openCursor(); cur.onsuccess = (e) => { const c = e.target.result; if (c) { if (String(c.key).startsWith(prefix)) st.delete(c.key); c.continue(); } }; tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch { /* ignore */ } }
 async function idbClearAll() { try { const db = await idb(); await new Promise((res, rej) => { const tx = db.transaction(STORE, 'readwrite'); tx.objectStore(STORE).clear(); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch { /* ignore */ } }
@@ -216,8 +220,14 @@ async function loadCachedScope(gids, onProgress) {
   if (!snap || !snap.have) return new Set();
   const byProj = {};
   (snap.tasks || []).forEach((t) => { (byProj[t._projectGid] || (byProj[t._projectGid] = [])).push(t); });
-  snap.have.forEach((pg) => { const arr = byProj[pg] || []; state.cache.projectTasks[pg] = arr; idbSet(`t3:${ws}:${pg}`, arr); });
-  Object.entries(snap.entries || {}).forEach(([tg, v]) => { if (!state.cache.taskEntries[tg]) state.cache.taskEntries[tg] = v; idbSet(`e:${ws}:${tg}`, v); });
+  // Hydrate the in-memory cache now (this is what the report needs to draw)…
+  const taskPairs = [];
+  snap.have.forEach((pg) => { const arr = byProj[pg] || []; state.cache.projectTasks[pg] = arr; taskPairs.push([`t3:${ws}:${pg}`, arr]); });
+  const entryPairs = [];
+  Object.entries(snap.entries || {}).forEach(([tg, v]) => { if (!state.cache.taskEntries[tg]) state.cache.taskEntries[tg] = v; entryPairs.push([`e:${ws}:${tg}`, v]); });
+  // …then persist to IndexedDB in the background, batched into one transaction
+  // each, so writing a large scope never blocks the report from rendering.
+  setTimeout(() => { idbSetMany(taskPairs); idbSetMany(entryPairs); }, 0);
   return new Set(snap.have);
 }
 
@@ -786,8 +796,10 @@ function contentFields(t, specs) {
 function scopeHasContent() {
   const r = state.report;
   if (!r || !r.tasks || !r.tasks.length) return false;
+  if (r._hasContent !== undefined) return r._hasContent; // computed once per report
   const specs = resolveFieldSpecs(r.tasks);
-  return r.tasks.some((t) => { const c = contentFields(t, specs); return !!(c.writer || c.editor); });
+  r._hasContent = r.tasks.some((t) => { const c = contentFields(t, specs); return !!(c.writer || c.editor); });
+  return r._hasContent;
 }
 // Tasks in the current selection (people / person / date filters), plus a
 // per-task time function — mirrors the Overview's scoping so numbers agree.
@@ -996,8 +1008,9 @@ function topTasks(entries) {
 function trendData(entries, basis) {
   const dated = entries.filter((e) => e.minutes > 0 && dateFor(e, basis));
   if (!dated.length) return null;
-  const times = dated.map((e) => +dateFor(e, basis));
-  const span = (Math.max(...times) - Math.min(...times)) / DAY;
+  let mn = Infinity, mx = -Infinity;
+  for (const e of dated) { const t = +dateFor(e, basis); if (t < mn) mn = t; if (t > mx) mx = t; }
+  const span = (mx - mn) / DAY;
   const unit = span <= 45 ? 'day' : span <= 220 ? 'week' : 'month';
   const bucket = new Map();
   dated.forEach((e) => { const k = +bucketStart(dateFor(e, basis), unit); bucket.set(k, (bucket.get(k) || 0) + e.minutes); });
@@ -1102,13 +1115,24 @@ function barList(items) {
 /* ═══ Charts (Chart.js) ════════════════════════════════════ */
 function cssv(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 function destroy(id) { if (state.charts[id]) { state.charts[id].destroy(); delete state.charts[id]; } }
+// Turn OFF chart animations and cap the canvas pixel ratio. Animated canvas
+// redraws (which also re-run on every tab switch / filter change) are a big
+// jank/"page unresponsive" source on weak laptops; static charts are instant.
+let _chartCfg = false;
+function chartDefaults() {
+  if (_chartCfg || typeof Chart === 'undefined') return;
+  _chartCfg = true;
+  Chart.defaults.animation = false;
+  Chart.defaults.animations = { colors: false, x: false, y: false };
+  Chart.defaults.devicePixelRatio = Math.min(window.devicePixelRatio || 1, 1.75);
+}
 function drawDoughnut(id, labels, data, colors, unit) {
-  if (typeof Chart === 'undefined' || !$('#' + id)) return; destroy(id);
+  if (typeof Chart === 'undefined' || !$('#' + id)) return; chartDefaults(); destroy(id);
   const palette = colors || [cssv('--accent'), cssv('--accent-2'), cssv('--ok'), cssv('--warn'), cssv('--danger'), cssv('--info'), '#ec4899', '#14b8a6', '#f97316'];
   state.charts[id] = new Chart($('#' + id), { type: 'doughnut', data: { labels, datasets: [{ data, backgroundColor: palette, borderWidth: 0 }] }, options: { cutout: '60%', plugins: { legend: { position: 'right', labels: { color: cssv('--text-dim'), boxWidth: 11, padding: 9, font: { size: 11 } } }, tooltip: { callbacks: unit === 'h' ? { label: (c) => `${c.label}: ${c.parsed}h` } : {} } } } });
 }
 function drawLine(id, labels, data) {
-  if (typeof Chart === 'undefined' || !$('#' + id)) return; destroy(id);
+  if (typeof Chart === 'undefined' || !$('#' + id)) return; chartDefaults(); destroy(id);
   state.charts[id] = new Chart($('#' + id), { type: 'line', data: { labels, datasets: [{ data, borderColor: cssv('--accent'), backgroundColor: cssv('--accent') + '22', fill: true, tension: 0.32, pointRadius: 2, borderWidth: 2 }] }, options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `${c.parsed.y}h` } } }, scales: { x: { ticks: { color: cssv('--text-dim'), maxRotation: 0, autoSkip: true }, grid: { display: false } }, y: { beginAtZero: true, ticks: { color: cssv('--text-dim'), callback: (v) => v + 'h' }, grid: { color: cssv('--border') } } } } });
 }
 
