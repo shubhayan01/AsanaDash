@@ -181,10 +181,14 @@ async function loadCachedScope(gids, onProgress) {
   if (onProgress) onProgress('Checking for pre-loaded data…');
   let snap;
   try {
-    // Safety belt: never let this block the report. The server returns cached
-    // data immediately; if the network stalls, we just fall through to live fetch.
+    // Safety belt: only abort if the connection truly stalls — NOT just because
+    // the payload is big. The pre-loaded response can be tens of MB for a large
+    // multi-project scope (it carries every task + time entry), and aborting it
+    // early would throw away instant data and force a much slower live re-fetch.
+    // Scale the budget with the number of projects, capped generously.
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 12000);
+    const budget = Math.min(180000, Math.max(45000, need.length * 4000));
+    const timer = setTimeout(() => ctrl.abort(), budget);
     try {
       snap = await apiJson('/api/cached-scope', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace: ws, projects: need }), signal: ctrl.signal });
     } finally { clearTimeout(timer); }

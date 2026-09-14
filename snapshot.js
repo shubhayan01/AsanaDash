@@ -62,7 +62,10 @@ function createSnapshot(opts = {}) {
   // Tunables (env-overridable). Defaults stay well under Asana's rate limits.
   const CONCURRENCY = +opts.concurrency || 6;
   const PRUNE_DAYS = +opts.pruneDays || 90;  // delete projects unopened this long
-  const DATA_DIR = opts.dataDir || process.env.ASANA_CACHE_DIR || path.join(__dirname, '.cache');
+  // .trim() guards against a stray space/newline in the ASANA_CACHE_DIR env var
+  // (e.g. pasted with leading whitespace) — otherwise the path isn't absolute and
+  // the cache silently lands off the mounted volume, on ephemeral disk.
+  const DATA_DIR = (opts.dataDir || process.env.ASANA_CACHE_DIR || path.join(__dirname, '.cache')).trim();
   const PARSE_CACHE_MAX = +opts.parseCacheMax || 120; // hot projects kept parsed in RAM
 
   let meGid = null;
