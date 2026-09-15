@@ -19,6 +19,7 @@ const state = {
   selectedPortfolio: 'all', portfolios: [], portfolioItems: {}, projectIndex: new Map(),
   charts: {}, ai: { model: null },
   snapshot: { ready: false }, // server-side pre-loaded data for the current workspace
+  panel: null, // memoised { sig, entries, rendered:Set } so tab-toggling is instant
 };
 
 const settings = (() => { try { return { theme: 'dark', accent: '#6d5efc', fieldMap: {}, ...JSON.parse(localStorage.getItem('asanaDash.v4') || '{}') }; } catch { return { theme: 'dark', accent: '#6d5efc', fieldMap: {} }; } })();
@@ -512,6 +513,8 @@ function methodSub(r) {
 
 function buildReportShell(container) {
   const r = state.report, f = state.filters;
+  destroyAllCharts();   // the shell's canvases are about to be replaced
+  state.panel = null;   // fresh shell → all panels must re-render once
   const contentReady = scopeHasContent();
   if (f.tab === 'content' && !contentReady) f.tab = 'summary';
   const methodBanner = r.method === 'assignee' ? `<div class="banner warn" style="margin:0 0 16px">Estimated: per-person time entries weren’t available, so each task’s Actual time is credited to its assignee.</div>` : r.method === 'none' ? `<div class="banner warn" style="margin:0 0 16px">No logged time in this scope — showing task counts (time totals are 0).</div>` : '';
@@ -543,24 +546,44 @@ function syncQueryToFilters() {
   f.from = $('#range-from').value || null; f.to = $('#range-to').value || null;
 }
 
+// Signature of everything that affects a panel's CONTENT (not which tab is
+// shown). While this is unchanged, switching tabs is just show/hide — no
+// re-filtering, no re-aggregating, no chart rebuild — so toggling is instant.
+function panelSig(f) {
+  return [state.runId, state.report && state.report.method, f.basis, f.range, f.from, f.to, f.person, f.metric, [...(f.people || [])].sort().join('|')].join('~');
+}
 function updatePanels() {
   if (!state.report) return;
   syncQueryToFilters();
   const f = state.filters;
-  const entries = applyFilters(state.report.entries);
-  updateKpis(entries);
+
+  // Recompute (filter + KPIs) ONLY when the underlying data/filters change.
+  const sig = panelSig(f);
+  if (!state.panel || state.panel.sig !== sig) {
+    destroyAllCharts();
+    state.panel = { sig, entries: applyFilters(state.report.entries), rendered: new Set() };
+    updateKpis(state.panel.entries);
+  }
+  const P = state.panel;
+
   const contentPanel = $('#panel-content');
-  $('#panel-summary').hidden = f.tab !== 'summary';
-  if (contentPanel) contentPanel.hidden = f.tab !== 'content';
-  $('#panel-charts').hidden = f.tab !== 'charts';
-  $('#panel-sheet').hidden = f.tab !== 'sheet';
-  $('#panel-matrix').hidden = f.tab !== 'matrix';
-  if (f.tab === 'summary') renderOverview($('#panel-summary'), entries);
-  else if (f.tab === 'content' && contentPanel) renderContent(contentPanel);
-  else if (f.tab === 'charts') renderCharts($('#panel-charts'), entries);
-  else if (f.tab === 'sheet') renderSheet($('#panel-sheet'), entries);
-  else if (f.tab === 'matrix') renderMatrix($('#panel-matrix'), entries, f.metric);
-  else renderOverview($('#panel-summary'), entries);
+  const tab = (f.tab === 'content' && !contentPanel) ? 'summary' : f.tab;
+  $('#panel-summary').hidden = tab !== 'summary';
+  if (contentPanel) contentPanel.hidden = tab !== 'content';
+  $('#panel-charts').hidden = tab !== 'charts';
+  $('#panel-sheet').hidden = tab !== 'sheet';
+  $('#panel-matrix').hidden = tab !== 'matrix';
+
+  // Render the visible panel at most once per signature; a repeat visit while
+  // the signature is unchanged is a no-op (the panel is already in the DOM).
+  if (P.rendered.has(tab)) return;
+  if (tab === 'summary') renderOverview($('#panel-summary'), P.entries);
+  else if (tab === 'content') renderContent(contentPanel);
+  else if (tab === 'charts') renderCharts($('#panel-charts'), P.entries);
+  else if (tab === 'sheet') renderSheet($('#panel-sheet'), P.entries);
+  else if (tab === 'matrix') renderMatrix($('#panel-matrix'), P.entries, f.metric);
+  else renderOverview($('#panel-summary'), P.entries);
+  P.rendered.add(tab);
 }
 
 function updateKpis(entries) {
@@ -1121,6 +1144,7 @@ function barList(items) {
 /* ═══ Charts (Chart.js) ════════════════════════════════════ */
 function cssv(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 function destroy(id) { if (state.charts[id]) { state.charts[id].destroy(); delete state.charts[id]; } }
+function destroyAllCharts() { Object.keys(state.charts).forEach(destroy); }
 // Turn OFF chart animations and cap the canvas pixel ratio. Animated canvas
 // redraws (which also re-run on every tab switch / filter change) are a big
 // jank/"page unresponsive" source on weak laptops; static charts are instant.
@@ -1327,8 +1351,10 @@ function wireChrome() {
     else { banner('Cache cleared for this workspace — next Generate will re-scrape.', 'info'); setTimeout(() => banner(''), 2200); }
   });
   $('#logout-btn').addEventListener('click', async () => { await fetch('/api/logout', { method: 'POST' }); window.location.href = '/login.html'; });
-  $('#theme-btn').addEventListener('click', () => { settings.theme = settings.theme === 'dark' ? 'light' : 'dark'; applyTheme(); saveSettings(); if (state.report) updatePanels(); });
-  $('#accent-picker').addEventListener('input', (e) => { settings.accent = e.target.value; applyTheme(); saveSettings(); if (state.report) updatePanels(); });
+  // Theme/accent change the chart colors, which are read at draw time — so
+  // invalidate the panel cache to force a redraw (not just a show/hide).
+  $('#theme-btn').addEventListener('click', () => { settings.theme = settings.theme === 'dark' ? 'light' : 'dark'; applyTheme(); saveSettings(); if (state.report) { state.panel = null; updatePanels(); } });
+  $('#accent-picker').addEventListener('input', (e) => { settings.accent = e.target.value; applyTheme(); saveSettings(); if (state.report) { state.panel = null; updatePanels(); } });
   $('#accent-btn').addEventListener('click', (e) => { if (e.target.tagName !== 'INPUT') $('#accent-picker').click(); });
 
   const toggleMenu = (sel) => { ['#proj-menu', '#emp-menu'].forEach((s) => { if (s !== sel) $(s).hidden = true; }); const m = $(sel); m.hidden = !m.hidden; };
