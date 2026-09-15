@@ -89,6 +89,8 @@ function createSnapshot(opts = {}) {
 
   let meGid = null;
   let building = false;
+  let aborted = false;    // set by stop()/purgeAll() to bail out of an in-flight build
+  let runGen = 0;         // invalidates a superseded refreshAll so its finally can't fight a new one
   let lastError = null;
   let lastRunAt = null;
   const wsMeta = new Map(); // ws → { projects:[{gid,name}], allGids:[...], scanned }
@@ -242,6 +244,7 @@ function createSnapshot(opts = {}) {
 
     const timed = tasks.filter((t) => (t.actual_time_minutes || 0) > 0);
     await mapPool(timed, CONCURRENCY, async (t) => {
+      if (aborted) return; // stop() / purge asked us to bail
       try {
         const res = await asanaGet(`tasks/${t.gid}/time_tracking_entries?opt_fields=duration_minutes,entered_on,created_by.name`);
         // Keep only time logged on/after the floor date (YYYY-MM-DD compares
@@ -314,7 +317,9 @@ function createSnapshot(opts = {}) {
   /* ── Nightly refresh: keep cached fresh + complete coverage ──── */
   async function refreshAll() {
     if (building || !token) return;
-    building = true; lastError = null;
+    building = true; aborted = false; lastError = null;
+    const myGen = ++runGen;                       // this run's identity
+    const alive = () => !aborted && myGen === runGen; // false once stopped/superseded
     const t0 = Date.now();
     try {
       meGid = (await asanaGet('users/me?opt_fields=name').catch(() => null))?.data?.gid || meGid;
@@ -323,6 +328,7 @@ function createSnapshot(opts = {}) {
       const runStart = new Date().toISOString();
 
       for (const w of workspaces) {
+        if (!alive()) break;
         const ws = w.gid;
         await ensureWsMeta(ws, true).catch(() => {});
 
@@ -337,6 +343,7 @@ function createSnapshot(opts = {}) {
         // 2) Incrementally refresh everything already cached for this workspace.
         const cached = await listCachedGids(ws);
         await mapPool(cached, CONCURRENCY, async (gid) => {
+          if (!alive()) return;
           try { await buildProject(ws, gid, sinceBase); } catch (e) { lastError = String(e); }
         });
 
@@ -346,24 +353,36 @@ function createSnapshot(opts = {}) {
         const cachedSet = new Set(cached);
         const uncached = (meta ? meta.allGids : []).filter((g) => !cachedSet.has(String(g)));
         await mapPool(uncached, CONCURRENCY, async (gid) => {
+          if (!alive()) return;
           try { await buildProject(ws, gid, null); } catch (e) { lastError = String(e); }
         });
       }
-      lastRunAt = runStart;
-      console.log(`  📸 Cache refresh done in ${((Date.now() - t0) / 1000).toFixed(1)}s — gap ${gap}ms, day ${istCacheDay()}.`);
+      if (alive()) lastRunAt = runStart;
+      console.log(`  📸 Cache refresh ${alive() ? 'done' : 'stopped'} in ${((Date.now() - t0) / 1000).toFixed(1)}s — gap ${gap}ms, day ${istCacheDay()}.`);
     } catch (e) {
       lastError = String(e);
       console.log(`  ⚠  Cache refresh failed: ${lastError}`);
     } finally {
-      building = false;
+      if (myGen === runGen) building = false; // don't clear a newer run's flag
     }
+  }
+
+  // Ask any in-flight build to stop as soon as possible (workers bail before
+  // their next task). Used before purge, or to cancel a long prefetch.
+  function stop() {
+    aborted = true;
+    runGen++;              // invalidate the current run
+    building = false;      // let a fresh refreshAll start immediately
+    warmQueue.clear();     // drop queued background warms too
   }
 
   /* ── Delete EVERYTHING cached (so the next refresh rebuilds clean) ────
    * Used to drop the old, pre-floor data on demand ("delete the earlier data")
-   * so a fresh, floored full fetch replaces it. Resets lastRunAt so the next
+   * so a fresh, floored full fetch replaces it. Stops any in-flight build first
+   * (otherwise it would keep writing old data), and resets lastRunAt so the next
    * refreshAll does a full (not incremental) pull. */
   async function purgeAll() {
+    stop();                // halt the current prefetch before wiping
     parsed.clear();
     memStore.clear();
     lastRunAt = null;
@@ -386,7 +405,7 @@ function createSnapshot(opts = {}) {
     };
   }
 
-  return { ensureScope, refreshAll, purgeAll, status, isBuilding: () => building, lastError: () => lastError, istCacheDay, since: () => SINCE_FLOOR };
+  return { ensureScope, refreshAll, purgeAll, stop, status, isBuilding: () => building, lastError: () => lastError, istCacheDay, since: () => SINCE_FLOOR };
 }
 
 module.exports = { createSnapshot, istCacheDay };

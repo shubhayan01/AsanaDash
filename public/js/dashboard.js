@@ -202,33 +202,35 @@ async function loadCachedScope(gids, onProgress) {
   const ws = state.workspaceGid;
   const need = gids.filter((g) => !state.cache.projectTasks[g]); // skip what we already have locally
   if (!need.length) return new Set(gids);
-  if (onProgress) onProgress('Checking for pre-loaded data…');
-  let snap;
-  try {
-    // Safety belt: only abort if the connection truly stalls — NOT just because
-    // the payload is big. The pre-loaded response can be tens of MB for a large
-    // multi-project scope (it carries every task + time entry), and aborting it
-    // early would throw away instant data and force a much slower live re-fetch.
-    // Scale the budget with the number of projects, capped generously.
-    const ctrl = new AbortController();
-    const budget = Math.min(180000, Math.max(45000, need.length * 4000));
-    const timer = setTimeout(() => ctrl.abort(), budget);
+  const served = new Set();
+  // Fetch the pre-loaded data in SMALL BATCHES rather than one giant request.
+  // One big response can be tens of MB, and parsing it in a single shot freezes
+  // weak laptops ("page unresponsive"). Chunking keeps each JSON.parse small and
+  // we yield to the browser between batches so the tab stays responsive.
+  const CHUNK = 15;
+  for (let i = 0; i < need.length; i += CHUNK) {
+    const batch = need.slice(i, i + CHUNK);
+    if (onProgress) onProgress(`Loading pre-saved data… ${Math.min(i + CHUNK, need.length)}/${need.length} projects`);
+    let snap;
     try {
-      snap = await apiJson('/api/cached-scope', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace: ws, projects: need }), signal: ctrl.signal });
-    } finally { clearTimeout(timer); }
-  } catch { return new Set(); }
-  if (!snap || !snap.have) return new Set();
-  const byProj = {};
-  (snap.tasks || []).forEach((t) => { (byProj[t._projectGid] || (byProj[t._projectGid] = [])).push(t); });
-  // Hydrate the in-memory cache now (this is what the report needs to draw)…
-  const taskPairs = [];
-  snap.have.forEach((pg) => { const arr = byProj[pg] || []; state.cache.projectTasks[pg] = arr; taskPairs.push([`t3:${ws}:${pg}`, arr]); });
-  const entryPairs = [];
-  Object.entries(snap.entries || {}).forEach(([tg, v]) => { if (!state.cache.taskEntries[tg]) state.cache.taskEntries[tg] = v; entryPairs.push([`e:${ws}:${tg}`, v]); });
-  // …then persist to IndexedDB in the background, batched into one transaction
-  // each, so writing a large scope never blocks the report from rendering.
-  setTimeout(() => { idbSetMany(taskPairs); idbSetMany(entryPairs); }, 0);
-  return new Set(snap.have);
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), Math.max(30000, batch.length * 4000));
+      try {
+        snap = await apiJson('/api/cached-scope', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspace: ws, projects: batch }), signal: ctrl.signal });
+      } finally { clearTimeout(timer); }
+    } catch { continue; } // this batch falls through to the live fetch
+    if (!snap || !snap.have) { await sleep(0); continue; }
+    const byProj = {};
+    (snap.tasks || []).forEach((t) => { (byProj[t._projectGid] || (byProj[t._projectGid] = [])).push(t); });
+    const taskPairs = [];
+    snap.have.forEach((pg) => { const arr = byProj[pg] || []; state.cache.projectTasks[pg] = arr; taskPairs.push([`t3:${ws}:${pg}`, arr]); served.add(pg); });
+    const entryPairs = [];
+    Object.entries(snap.entries || {}).forEach(([tg, v]) => { if (!state.cache.taskEntries[tg]) state.cache.taskEntries[tg] = v; entryPairs.push([`e:${ws}:${tg}`, v]); });
+    // Persist batched (one transaction each), off the render path.
+    setTimeout(() => { idbSetMany(taskPairs); idbSetMany(entryPairs); }, 0);
+    await sleep(0); // let the browser paint / stay responsive between batches
+  }
+  return served;
 }
 
 // Portfolios (departments) — org workspaces only; Asana lists those you own.

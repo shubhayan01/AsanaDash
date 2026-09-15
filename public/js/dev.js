@@ -78,9 +78,9 @@ async function startFetch() {
 }
 
 async function startPurge() {
-  if (!confirm('Delete ALL cached data on the server and re-download it fresh (only Jan 2026 → now)?\n\nReports may be slower until the rebuild finishes.')) return;
+  if (!confirm('Stop any current fetch, delete ALL cached data on the server, and re-download it fresh (only Jan 2026 → now)?\n\nReports may be slower until the rebuild finishes.')) return;
   btn.disabled = true; purgeBtn.disabled = true;
-  setStatus('Deleting old data and starting a fresh download…');
+  setStatus('Stopping current fetch, deleting old data, starting a fresh download…');
   try {
     await apiJson('/api/purge-cache', { method: 'POST' });
   } catch (e) {
@@ -121,8 +121,12 @@ async function refreshStatus() {
   }
 
   btn.disabled = active;
-  purgeBtn.disabled = active;
+  // Purge stays clickable WHILE fetching — it stops the current run, deletes the
+  // cache, and re-downloads fresh. (This is the escape hatch when a long prefetch
+  // is stuck.) It's only disabled for the moment its own request is in flight.
+  purgeBtn.disabled = false;
   btn.textContent = active ? '⏳  Fetching…' : (cached > 0 ? '↻  Fetch again / update' : '⬇  Fetch & save all data now');
+  purgeBtn.textContent = active ? '⏹  Stop, delete & re-download fresh' : '🗑  Delete old data & re-download fresh';
   if (s.since) { const el = $('#since-note'); if (el) el.textContent = `Only data from ${fmtSince(s.since)} onward is fetched.`; }
 
   if (s.lastError) { setStatus('Last error: ' + s.lastError, true); }
