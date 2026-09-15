@@ -85,6 +85,7 @@ function createSnapshot(opts = {}) {
   // the cache to recent work (default: Jan 2026 onward) instead of the full,
   // years-deep history — far less to download, store, and ship to the browser.
   const SINCE_FLOOR = normSince(opts.since || process.env.FETCH_SINCE || '2026-01-01');
+  const SINCE_DATE = SINCE_FLOOR.slice(0, 10); // YYYY-MM-DD, for filtering entered_on
 
   let meGid = null;
   let building = false;
@@ -243,7 +244,10 @@ function createSnapshot(opts = {}) {
     await mapPool(timed, CONCURRENCY, async (t) => {
       try {
         const res = await asanaGet(`tasks/${t.gid}/time_tracking_entries?opt_fields=duration_minutes,entered_on,created_by.name`);
-        rec.entries[t.gid] = res.data || [];
+        // Keep only time logged on/after the floor date (YYYY-MM-DD compares
+        // lexicographically) — smaller payload + "actual time tracked" is the
+        // time logged from Jan 2026 onward, not a task's whole history.
+        rec.entries[t.gid] = (res.data || []).filter((e) => !e.entered_on || e.entered_on >= SINCE_DATE);
       } catch { /* keep any prior entries */ }
     });
     const live = new Set(rec.tasks.map((t) => t.gid));

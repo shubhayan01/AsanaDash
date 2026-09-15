@@ -363,12 +363,15 @@ async function fetchScope(projectGids, precise, onProgress, onPartial) {
   if (onPartial && needFetch > 0) { const est = estimate(); onPartial({ tasks, entries: est.entries, method: est.method, timed: timed.length }); }
 
   let entries = [], method;
+  const sinceDate = FETCH_SINCE_ISO.slice(0, 10); // YYYY-MM-DD floor for entered_on
   if (precise && timed.length) {
     let used = false;
     await mapPool(timed, 12, async (t) => {
       let data = state.cache.taskEntries[t.gid];
       if (!data) { try { const res = await asanaRetry(`tasks/${t.gid}/time_tracking_entries?opt_fields=duration_minutes,entered_on,created_by.name`); data = res.data || []; state.cache.taskEntries[t.gid] = data; state.net.entries++; idbSet(`e:${state.workspaceGid}:${t.gid}`, data); } catch { data = []; } }
-      data.forEach((e) => { used = true; const u = e.created_by || {}; entries.push(mkEntry(t, u.gid, u.name || 'Unknown', e.duration_minutes || 0, e.entered_on)); });
+      // Credit each logged entry to whoever LOGGED it (created_by), keeping only
+      // time logged on/after the floor date.
+      data.forEach((e) => { if (e.entered_on && e.entered_on < sinceDate) return; used = true; const u = e.created_by || {}; entries.push(mkEntry(t, u.gid, u.name || 'Unknown', e.duration_minutes || 0, e.entered_on)); });
     }, (d, t) => onProgress(`Refining exact time… ${d}/${t} tasks`, true));
     if (used && entries.length) method = 'entries';
   }
@@ -550,12 +553,12 @@ function updatePanels() {
   $('#panel-charts').hidden = f.tab !== 'charts';
   $('#panel-sheet').hidden = f.tab !== 'sheet';
   $('#panel-matrix').hidden = f.tab !== 'matrix';
-  if (f.tab === 'summary') renderOverview($('#panel-summary'));
+  if (f.tab === 'summary') renderOverview($('#panel-summary'), entries);
   else if (f.tab === 'content' && contentPanel) renderContent(contentPanel);
   else if (f.tab === 'charts') renderCharts($('#panel-charts'), entries);
   else if (f.tab === 'sheet') renderSheet($('#panel-sheet'), entries);
   else if (f.tab === 'matrix') renderMatrix($('#panel-matrix'), entries, f.metric);
-  else renderOverview($('#panel-summary'));
+  else renderOverview($('#panel-summary'), entries);
 }
 
 function updateKpis(entries) {
@@ -566,7 +569,7 @@ function updateKpis(entries) {
   const tasksWorked = new Set(entries.filter((e) => e.minutes > 0 || noTime).map((e) => e.taskGid)).size;
   $('#kpi-row').innerHTML =
     kpiCard(noTime ? '—' : fmtDuration(totalMin), 'Actual time', 'accent', 'sum-people') +
-    kpiCard(people, people === 1 ? 'Assignee' : 'Assignees', '', 'sum-people') +
+    kpiCard(people, people === 1 ? 'Person' : 'People', '', 'sum-people') +
     kpiCard(projects, projects === 1 ? 'Project' : 'Projects', '', 'sum-projects') +
     kpiCard(tasksWorked, 'Tasks', '', 'sum-projects');
   $$('#kpi-row .stat[data-jump]').forEach((c) => c.addEventListener('click', () => {
@@ -665,6 +668,25 @@ function richAgg(tasks, keyFn, nameFn, timeFn) {
   });
   return [...m.values()].sort((a, b) => b.minutes - a.minutes || b.assigned - a.assigned);
 }
+// Aggregate TIME-TRACKING ENTRIES by a key (person = who logged the time, or
+// project). This is the actual tracked time: each entry's minutes are credited
+// to whoever LOGGED it (created_by), never to the task's current assignee — so
+// if A logs time then the task is reassigned to B, the time stays with A.
+// Task counts are distinct tasks the key appears on within the current filter.
+function entryAgg(entries, keyFn, nameFn) {
+  const m = new Map();
+  entries.forEach((e) => {
+    const k = keyFn(e); if (k == null) return;
+    let r = m.get(k);
+    if (!r) { r = { key: k, name: nameFn(e), minutes: 0, tasks: new Set(), done: new Set(), over: new Set() }; m.set(k, r); }
+    r.minutes += e.minutes; r.tasks.add(e.taskGid);
+    if (e.completed) r.done.add(e.taskGid);
+    if (e.overdue) r.over.add(e.taskGid);
+  });
+  return [...m.values()]
+    .map((r) => ({ key: r.key, name: r.name, minutes: r.minutes, assigned: r.tasks.size, done: r.done.size, overdue: r.over.size }))
+    .sort((a, b) => b.minutes - a.minutes || b.assigned - a.assigned);
+}
 function richTable(rows, label, showTime) {
   if (!rows.length) return '<p class="empty">No data for this selection.</p>';
   const th = `<th>${esc(label)}</th><th class="num">Tasks</th><th class="num">Completed</th><th class="num">Incomplete task</th>` +
@@ -672,7 +694,7 @@ function richTable(rows, label, showTime) {
   return `<div class="table-wrap card-scroll"><table class="data">
     <thead><tr>${th}</tr></thead>
     <tbody>${rows.map((r) => `<tr>
-      <td>${label === 'Assignee' ? `<span class="avatar">${esc(initials(r.name))}</span>` : '📁 '}${esc(r.name)}</td>
+      <td>${label === 'Project' ? '📁 ' : `<span class="avatar">${esc(initials(r.name))}</span>`}${esc(r.name)}</td>
       <td class="num">${r.assigned}</td>
       <td class="num">${r.done}</td>
       <td class="num">${r.overdue ? `<span style="color:var(--danger)">${r.overdue}</span>` : 0}</td>
@@ -689,45 +711,27 @@ function exportRich(rows, label, showTime) {
   }));
 }
 
-function renderOverview(panel) {
+function renderOverview(panel, entries) {
   const r = state.report, f = state.filters;
-  const today = startOfToday();
-  const bounds = rangeBounds(f.range, f.from, f.to);
-  const dateFilter = !(bounds[0] === null && bounds[1] === null);
-  const basis = f.basis;
   const showTime = r.method !== 'none';
+  // Single source of truth = the filtered time-tracking entries (already scoped
+  // by people / person / date-basis in applyFilters). Time is credited to the
+  // person who LOGGED it (created_by → e.userGid), not the task's assignee.
+  const fe = entries || applyFilters(r.entries);
 
-  // Entries grouped by task (for "Actual time tracked" date filtering + time).
-  const ebt = new Map();
-  r.entries.forEach((e) => { let a = ebt.get(e.taskGid); if (!a) { a = []; ebt.set(e.taskGid, a); } a.push(e); });
-  const taskDate = (t) => basis === 'created' ? parseDate(t.created_at) : basis === 'completed' ? parseDate(t.completed_at) : basis === 'due' ? parseDate(t.due_at || t.due_on) : null;
-  const inScope = (t) => {
-    if (f.people && f.people.size && (!t.assignee || !f.people.has(t.assignee.gid))) return false;
-    if (f.person !== 'all' && (!t.assignee || t.assignee.gid !== f.person)) return false;
-    if (!dateFilter) return true;
-    if (basis === 'tracked') return (ebt.get(t.gid) || []).some((e) => inBounds(e.enteredOn, bounds));
-    return inBounds(taskDate(t), bounds);
-  };
-  const timeFn = (t) => {
-    if (basis === 'tracked' && dateFilter) return (ebt.get(t.gid) || []).filter((e) => inBounds(e.enteredOn, bounds)).reduce((s, e) => s + e.minutes, 0);
-    return t.actual_time_minutes || 0;
-  };
+  const byProject = entryAgg(fe, (e) => e.projectGid, (e) => e.projectName);
+  const byPerson = entryAgg(fe, (e) => e.userGid, (e) => e.userName);
 
-  const tasks = r.tasks.filter(inScope);
-  tasks.forEach((t) => { const due = parseDate(t.due_at || t.due_on); t._overdue = !t.completed && due && due < today; });
-
-  const byProject = richAgg(tasks, (t) => t._projectGid, (t) => t._projectName, timeFn);
-  const byPerson = richAgg(tasks, (t) => (t.assignee ? t.assignee.gid : 'none'), (t) => (t.assignee ? t.assignee.name : 'Unassigned'), timeFn);
-
-  const totalMin = tasks.reduce((s, t) => s + timeFn(t), 0);
-  const sentence = `<b>${byPerson.length}</b> ${byPerson.length === 1 ? 'assignee' : 'assignees'} · <b>${byProject.length}</b> project${byProject.length !== 1 ? 's' : ''} · <b>${tasks.length}</b> task${tasks.length !== 1 ? 's' : ''}${showTime ? ` · <b>${fmtDuration(totalMin)}</b>` : ''}.`;
+  const totalMin = fe.reduce((s, e) => s + e.minutes, 0);
+  const taskCount = new Set(fe.map((e) => e.taskGid)).size;
+  const sentence = `<b>${byPerson.length}</b> ${byPerson.length === 1 ? 'person' : 'people'} · <b>${byProject.length}</b> project${byProject.length !== 1 ? 's' : ''} · <b>${taskCount}</b> task${taskCount !== 1 ? 's' : ''}${showTime ? ` · <b>${fmtDuration(totalMin)}</b> tracked` : ''}.`;
 
   panel.innerHTML =
     `<div class="summary-hero">${sentence}</div>
      <div class="card" id="sum-projects" style="margin-bottom:18px"><div class="ov-head"><h3>📁 By project</h3><div class="ov-tools"><input class="input ov-search" placeholder="🔍 Find a project…"><button class="export-btn" id="ov-proj-csv">⬇ Excel/CSV</button></div></div>${richTable(byProject, 'Project', showTime)}</div>
-     <div class="card" id="sum-people"><div class="ov-head"><h3>👥 By assignee</h3><div class="ov-tools"><input class="input ov-search" placeholder="🔍 Find a person…"><button class="export-btn" id="ov-emp-csv">⬇ Excel/CSV</button></div></div>${richTable(byPerson, 'Assignee', showTime)}</div>`;
+     <div class="card" id="sum-people"><div class="ov-head"><h3>👥 By person <span class="muted">· time credited to who logged it</span></h3><div class="ov-tools"><input class="input ov-search" placeholder="🔍 Find a person…"><button class="export-btn" id="ov-emp-csv">⬇ Excel/CSV</button></div></div>${richTable(byPerson, 'Person', showTime)}</div>`;
   $('#ov-proj-csv').addEventListener('click', () => exportRich(byProject, 'Project', showTime));
-  $('#ov-emp-csv').addEventListener('click', () => exportRich(byPerson, 'Assignee', showTime));
+  $('#ov-emp-csv').addEventListener('click', () => exportRich(byPerson, 'Person', showTime));
   // Live row filter — hide non-matching rows without re-rendering (keeps focus).
   panel.querySelectorAll('.ov-search').forEach((inp) => inp.addEventListener('input', () => {
     const card = inp.closest('.card'), q = inp.value.trim().toLowerCase();
